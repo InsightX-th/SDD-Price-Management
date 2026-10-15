@@ -12,7 +12,8 @@ final class Updater {
     private const RELEASE_ERROR_CACHE = 'sdd_stock_price_release_check_error';
 
     public static function boot(): void {
-        add_filter('pre_set_site_transient_update_plugins', [self::class, 'filterUpdates']);
+        // Run before older updater libraries that assume response/no_update are arrays.
+        add_filter('pre_set_site_transient_update_plugins', [self::class, 'filterUpdates'], 1);
         add_filter('plugins_api', [self::class, 'pluginInformation'], 10, 3);
     }
 
@@ -22,19 +23,23 @@ final class Updater {
         $pluginFile = plugin_basename(SDD_FILE);
         if (!array_key_exists($pluginFile, $transient->checked)) { return $transient; }
 
+        // WordPress and other plugins expect these collections to be arrays.
+        // Convert stale object-shaped values written by earlier updater code.
+        if (isset($transient->response) && is_object($transient->response)) { $transient->response = get_object_vars($transient->response); }
+        elseif (!isset($transient->response) || !is_array($transient->response)) { $transient->response = []; }
+        if (isset($transient->no_update) && is_object($transient->no_update)) { $transient->no_update = get_object_vars($transient->no_update); }
+        elseif (!isset($transient->no_update) || !is_array($transient->no_update)) { $transient->no_update = []; }
+
         $release = self::latestRelease();
         if ($release === null) { return $transient; }
 
-        if (!isset($transient->response) || !is_object($transient->response)) { $transient->response = (object)[]; }
-        if (!isset($transient->no_update) || !is_object($transient->no_update)) { $transient->no_update = (object)[]; }
-
         $details = self::updateDetails($pluginFile, $release);
         if (version_compare($release['version'], SDD_VERSION, '>')) {
-            $transient->response->{$pluginFile} = $details;
-            unset($transient->no_update->{$pluginFile});
+            $transient->response[$pluginFile] = $details;
+            unset($transient->no_update[$pluginFile]);
         } else {
-            $transient->no_update->{$pluginFile} = $details;
-            unset($transient->response->{$pluginFile});
+            $transient->no_update[$pluginFile] = $details;
+            unset($transient->response[$pluginFile]);
         }
         return $transient;
     }
