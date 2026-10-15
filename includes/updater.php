@@ -20,6 +20,15 @@ final class Updater {
         // Normalize malformed collection containers before legacy updater callbacks run.
         add_filter('pre_set_site_transient_update_plugins', [self::class, 'normalizeTransient'], 1);
         add_filter('plugins_api', [self::class, 'pluginInformation'], 10, 3);
+        $plugin = plugin_basename(SDD_FILE);
+        add_filter('plugin_action_links_' . $plugin, [self::class, 'actionLinks']);
+        add_filter('network_admin_plugin_action_links_' . $plugin, [self::class, 'actionLinks']);
+        add_action('admin_post_sdd_check_updates', [self::class, 'handleCheck']);
+        add_action('admin_notices', [self::class, 'checkNotice']);
+        add_action('network_admin_notices', [self::class, 'checkNotice']);
+        add_action('load-update-core.php', static function (): void {
+            if (!empty($_GET['force-check']) && current_user_can('update_plugins')) { self::checkForUpdates(); }
+        }, 1);
     }
 
     public static function normalizeTransient(mixed $transient): mixed {
@@ -34,11 +43,66 @@ final class Updater {
         return $transient;
     }
 
-    public static function updateUriResponse(mixed $update, array $pluginData, string $pluginFile, array $locales): array|false {
+    public static function updateUriResponse(mixed $update, array $pluginData, string $pluginFile, array $locales): mixed {
         if ($pluginFile !== plugin_basename(SDD_FILE) || ($pluginData['UpdateURI'] ?? '') !== self::repositoryUrl()) { return $update; }
         $release = self::latestRelease();
-        if ($release === null || version_compare($release['version'], SDD_VERSION, '<=')) { return false; }
+        if ($release === null) { return false; }
         return self::updateDetails($release);
+    }
+
+    public static function actionLinks(array $links): array {
+        if (current_user_can('update_plugins')) {
+            $url = wp_nonce_url(admin_url('admin-post.php?action=sdd_check_updates'), 'sdd_check_updates');
+            $links['sdd_check_updates'] = '<a href="' . esc_url($url) . '">ตรวจสอบอัปเดต</a>';
+        }
+        return $links;
+    }
+
+    /** Check only this plugin, bypassing our cache and WordPress.org availability. */
+    public static function checkForUpdates(): array {
+        if (!current_user_can('update_plugins')) { return ['status' => 'forbidden']; }
+        delete_site_transient(self::RELEASE_CACHE);
+        delete_site_transient(self::RELEASE_ERROR_CACHE);
+        $release = self::latestRelease();
+        if ($release === null) { return ['status' => 'error']; }
+
+        $file = plugin_basename(SDD_FILE);
+        $state = get_site_transient('update_plugins');
+        $state = self::normalizeTransient(is_object($state) ? $state : new \stdClass());
+        $state->checked = is_object($state->checked ?? null) ? get_object_vars($state->checked) : (is_array($state->checked ?? null) ? $state->checked : []);
+        $state->checked[$file] = SDD_VERSION;
+        $details = (object) (self::updateDetails($release) + ['new_version' => $release['version'], 'plugin' => $file, 'id' => self::repositoryUrl()]);
+        $available = version_compare($release['version'], SDD_VERSION, '>');
+        unset($state->response[$file], $state->no_update[$file]);
+        if ($available) { $state->response[$file] = $details; }
+        else { $state->no_update[$file] = $details; }
+        // Preserve other plugins and their last_checked timestamp.
+        set_site_transient('update_plugins', $state);
+        return ['status' => $available ? 'available' : 'current', 'version' => $release['version']];
+    }
+
+    public static function handleCheck(): void {
+        if (!current_user_can('update_plugins')) { wp_die(esc_html__('ไม่มีสิทธิ์อัปเดตปลั๊กอิน', 'sdd-stock-price'), '', ['response' => 403]); }
+        check_admin_referer('sdd_check_updates');
+        set_transient('sdd_update_notice_' . get_current_user_id(), self::checkForUpdates(), MINUTE_IN_SECONDS);
+        wp_safe_redirect(self_admin_url('plugins.php'));
+        exit;
+    }
+
+    public static function checkNotice(): void {
+        if (!current_user_can('update_plugins')) { return; }
+        $key = 'sdd_update_notice_' . get_current_user_id();
+        $notice = get_transient($key);
+        if (!is_array($notice)) { return; }
+        delete_transient($key);
+        $status = $notice['status'] ?? 'error';
+        $version = $notice['version'] ?? '';
+        $message = match ($status) {
+            'available' => 'SoundDD: พบเวอร์ชัน ' . $version . ' แล้ว กด “อัปเดตตอนนี้” ใต้ชื่อปลั๊กอินเพื่อติดตั้ง',
+            'current' => 'SoundDD: ตรวจสอบแล้ว รุ่นที่ติดตั้งเป็นรุ่นล่าสุดหรือใหม่กว่า GitHub Release (รุ่นเสถียรล่าสุด ' . $version . ')',
+            default => 'SoundDD: ยังตรวจสอบอัปเดตไม่ได้ กรุณาตรวจว่าเซิร์ฟเวอร์เชื่อมต่อ api.github.com และ github.com ได้ แล้วลองอีกครั้ง',
+        };
+        echo '<div class="notice ' . ($status === 'error' ? 'notice-warning' : 'notice-success') . ' is-dismissible"><p>' . esc_html($message) . '</p></div>';
     }
 
     public static function pluginInformation(mixed $result, string $action, object $args): mixed {

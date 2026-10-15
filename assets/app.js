@@ -27,12 +27,58 @@ function editPrice(event,change){
 }
 function scheduleLabel(value){return (value||'|').split('|').map(token=>!token?'ไม่กำหนด':/^-?[0-9]+$/.test(token)?promoTime(token):token.replace('T',' ')).join(' → ');}
 class ApiError extends Error { constructor(data,status) { super(data.message || 'เกิดข้อผิดพลาด'); this.code=data.code; this.data=data.data || {}; this.status=status; } }
-async function api(path, body) {
- const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),15000);
- try {
-  const r=await fetch(cfg.api+path,{method:body===undefined?'GET':'POST',credentials:'same-origin',cache:'no-store',headers:{'X-WP-Nonce':nonce,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:controller.signal});
-  const data=await r.json(); if (!r.ok) throw new ApiError(data,r.status); return data;
- } finally { clearTimeout(timer); }
+let connectionError=null,nonceRefreshPromise=null;
+function pauseConnection(error){
+ if(connectionError)return;
+ connectionError=new ApiError({code:'session_unavailable',message:error.message},error.status||403);
+ window.dispatchEvent(new CustomEvent('sdd:connection-error',{detail:error}));
+}
+async function responseJSON(response,write=false){
+ let data;
+ try{data=JSON.parse(await response.text());}catch(e){/* HTML error/login pages must never reach the JSON parser message in the UI. */}
+ if(!data||typeof data!=='object'||Array.isArray(data)){
+  const denied=[401,403].includes(response.status);
+  throw new ApiError({code:write?'operation_unknown':denied?'request_blocked':'invalid_response',message:denied?'เซิร์ฟเวอร์ปฏิเสธการเชื่อมต่อ (HTTP '+response.status+') กรุณาเชื่อมต่อใหม่ หากยังพบปัญหา ให้ผู้ดูแลตรวจระบบป้องกันของเว็บไซต์':write?'เซิร์ฟเวอร์ตอบกลับไม่ครบถ้วน ยังยืนยันผลบันทึกไม่ได้ กรุณาตรวจผลคำสั่งเดิมก่อนทำต่อ':'เซิร์ฟเวอร์ตอบกลับในรูปแบบที่ไม่รองรับ กรุณาลองใหม่'},response.status);
+ }
+ return data;
+}
+async function renewNonce(){
+ if(nonceRefreshPromise)return nonceRefreshPromise;
+ nonceRefreshPromise=(async()=>{
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);
+  try{
+   const response=await fetch(cfg.ajax+'?action=sdd_session',{credentials:'same-origin',cache:'no-store',signal:controller.signal});
+   const data=await responseJSON(response);
+   if(!response.ok||!data.success||typeof data.data?.nonce!=='string'||!data.data.nonce)throw new ApiError({code:'session_unavailable',message:data.data?.message||'ไม่สามารถต่ออายุการเชื่อมต่อได้ กรุณาเข้าสู่ระบบอีกครั้งแล้วกดเชื่อมต่อใหม่'},response.status);
+   if(String(data.data.user_id)!==String(cfg.userId))throw new ApiError({code:'session_changed',message:'บัญชีที่เข้าสู่ระบบเปลี่ยนไป กรุณาเปิดหน้าปลั๊กอินใหม่ก่อนแก้ไขสินค้า'},403);
+   nonce=data.data.nonce;
+  }catch(e){if(e instanceof ApiError)throw e;throw new ApiError({code:'session_unavailable',message:'ไม่สามารถต่ออายุการเชื่อมต่อได้ กรุณาตรวจอินเทอร์เน็ตแล้วกดเชื่อมต่อใหม่'},0);}
+  finally{clearTimeout(timer);}
+ })();
+ try{return await nonceRefreshPromise;}finally{nonceRefreshPromise=null;}
+}
+async function api(path, body, retry=true) {
+ if(connectionError)throw connectionError;
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000),sentNonce=nonce;
+ let response,data;
+ try{
+  response=await fetch(cfg.api+path,{method:body===undefined?'GET':'POST',credentials:'same-origin',cache:'no-store',headers:{'X-WP-Nonce':sentNonce,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:controller.signal});
+  data=await responseJSON(response,body!==undefined);
+ }catch(e){if([401,403].includes(e.status))pauseConnection(e);throw e;}
+ finally{clearTimeout(timer);}
+ if(!response.ok){
+  // Only WordPress's explicit nonce rejection proves a write was not executed.
+  if(response.status===403&&data.code==='rest_cookie_invalid_nonce'&&retry){
+   try{if(nonce===sentNonce)await renewNonce();}catch(e){pauseConnection(e);throw e;}
+   return api(path,body,false);
+  }
+  const error=new ApiError(data,response.status);
+  if(response.status===401||data.code==='rest_cookie_invalid_nonce'||(response.status===403&&typeof data.code!=='string'))pauseConnection(error);
+  throw error;
+ }
+ const freshNonce=response.headers.get('X-WP-Nonce');
+ if(freshNonce&&nonce===sentNonce)nonce=freshNonce;
+ return data;
 }
 const datePart=token=>{
  if(!token || /^\d{4}-\d{2}-\d{2}(T|$)/.test(token))return token.slice(0,10);
@@ -333,6 +379,7 @@ function App(){
  const generation=useRef(0),clientId=useRef(uuid()),liveState=useRef({});
  const [syncAt,setSyncAt]=useState(''),[syncMessage,setSyncMessage]=useState('');
  liveState.current={setup,session,loading};
+ useEffect(()=>{const failed=e=>{setSession(true);setError(e.detail.message);setSyncMessage('หยุดอัปเดตอัตโนมัติชั่วคราว');};window.addEventListener('sdd:connection-error',failed);return()=>window.removeEventListener('sdd:connection-error',failed);},[]);
  useEffect(()=>{const receive=e=>{for(const id of [...e.detail.items.map(r=>r.id),...e.detail.unavailable])workspacePresence.delete(id);for(const [id,entries] of Object.entries(e.detail.presence||{}))workspacePresence.set(id,entries);setData(d=>({...d,items:mergeLiveRows(d.items,e.detail)}));setSyncAt(e.detail.server_time);setSyncMessage('');};window.addEventListener('sdd:workspace-sync',receive);return()=>window.removeEventListener('sdd:workspace-sync',receive);},[]);
  useEffect(()=>{
   if(setup||auditProduct!==null||session)return;let stopped=false,running=false,debounce,nextAttempt=0;
@@ -355,7 +402,7 @@ function App(){
  useEffect(()=>{api('brands').then(r=>setBrands(r.items)).catch(()=>{});api('promotion-articles').then(r=>{setArticles(r.items);setArticlesError('');}).catch(e=>setArticlesError(e.message));},[tick]);
  useEffect(()=>{const g=++generation.current;setLoading(true);const q=new URLSearchParams({search:query,page,per_page:size,brand,stock_status:status,source,promotion_post:promotionPost,orderby,order,scope,promotion_status:promotion});api('products?'+q).then(r=>{if(g===generation.current){setData(r);setError('');}}).catch(e=>{if(g===generation.current){setError(e.message);if(e.status===401||e.code==='rest_cookie_invalid_nonce')setSession(true);}}).finally(()=>{if(g===generation.current)setLoading(false);});},[query,page,size,brand,status,source,promotionPost,tick,orderby,order,scope,promotion]);
  useEffect(()=>{const handler=e=>{if([...drafts.values(),...promoDrafts.values()].some(d=>d.state!=='clean')){e.preventDefault();e.returnValue='';}};window.addEventListener('beforeunload',handler);return()=>window.removeEventListener('beforeunload',handler);},[]);
- async function refreshSession(){try{const r=await fetch(cfg.ajax+'?action=sdd_session',{credentials:'same-origin',cache:'no-store'});const j=await r.json();if(!r.ok||!j.success)throw Error('กรุณา Login ใหม่ก่อน');nonce=j.data.nonce;setSession(false);setTick(t=>t+1);}catch(e){setError(e.message);}}
+ async function refreshSession(){try{await renewNonce();connectionError=null;setSession(false);setError('');setSyncMessage('');setTick(t=>t+1);}catch(e){setSession(true);setError(e.message);}}
  function saved(id,field,value,revision){generation.current++;setTick(t=>t+1);setData(d=>({...d,items:d.items.map(row=>row.id===id?{...row,[field]:value,revisions:{...row.revisions,[field]:revision}}:row)}));}
  const context={search:query,brand,stock_status:status,source,promotion_post:promotionPost,orderby,order,tick,scope,promotion_status:promotion};
  const shownArticles=articles.filter(a=>!articleSearch||(a.title+' '+a.id).toLocaleLowerCase().includes(articleSearch.toLocaleLowerCase())||a.id===promotionPost);
@@ -372,7 +419,7 @@ function App(){
  const filter=(label,value,set,options)=>h('label',{className:'sdd-filter'},h('span',null,label),h('select',{'aria-label':label,value,onChange:e=>{set(e.target.value);setPage(1);}},h('option',{value:''},'ทั้งหมด'),options.map(o=>h('option',{key:o.id,value:o.id},o.name))));
  return h('div',{className:'sdd-app'},h('header',{className:'sdd-topbar'},h('a',{className:'sdd-brand',href:cfg.back,'aria-label':'SoundDD กลับหลังบ้าน'},'SoundDD'),h('span',{className:'sdd-title-divider','aria-hidden':true}),h('strong',{className:'sdd-page-title'},'สต็อก & ราคา'),h('span',{className:'sdd-spacer'}),h('span',{className:'sdd-header-user'},cfg.user),cfg.canSettings&&h('button',{className:'sdd-settings-button',onClick:()=>{setSetup(s=>!s);setAuditProduct(null);}},h('span',{'aria-hidden':true},'⚙ '),'ตั้งค่า'),h('button',{className:'sdd-refresh-button',onClick:()=>setTick(t=>t+1),disabled:loading},h('span',{'aria-hidden':true},'↻ '),'รีเฟรช')),
  h('main',{className:'sdd-wrap'},h('details',{className:'sdd-note'},h('summary',null,'ข้อมูลการอัปเดตและคีย์ลัด'),h('span',null,'ข้อมูลล่าสุด '+((syncAt||data.server_time)?new Date(syncAt||data.server_time).toLocaleString('th-TH'):'—')+' · '+(syncMessage||'อัปเดตราคาที่แสดงทุก 15 วินาที')+' · รีเฟรชเพื่อปรับผลค้นหาและลำดับ · กด Enter เพื่อยืนยันราคา · Esc เพื่อยกเลิก')),
- session&&h('div',{className:'sdd-session'},h('a',{href:cfg.login,target:'_blank',rel:'noopener noreferrer'},'เข้าสู่ระบบอีกแท็บ'),h('button',{onClick:refreshSession},'เชื่อมต่อใหม่'),session&&h('span',null,'กรุณาเข้าสู่ระบบใหม่ ค่าที่พิมพ์ไว้ยังอยู่')),
+ session&&h('div',{className:'sdd-session',role:'alert'},h('a',{href:cfg.login,target:'_blank',rel:'noopener noreferrer'},'เข้าสู่ระบบอีกแท็บ'),h('button',{onClick:refreshSession},'เชื่อมต่อใหม่'),session&&h('span',null,'หยุดการเชื่อมต่อชั่วคราว ค่าที่พิมพ์ไว้ยังอยู่ · หากเข้าสู่ระบบหมดอายุ ให้เข้าสู่ระบบอีกแท็บแล้วกดเชื่อมต่อใหม่')),
  error&&h('p',{role:'alert',className:'sdd-error'},error),auditProduct!==null?h(AuditPanel,{productId:auditProduct,onClose:()=>setAuditProduct(null)}):setup?h(Setup,{onClose:()=>setSetup(false),onSaved:()=>setTick(t=>t+1)}):h(wp.element.Fragment,null,
  data.write_access&&!data.write_access.enabled&&h('section',{className:'sdd-warning',role:'status'},h('strong',null,'ขณะนี้เป็นโหมดอ่านอย่างเดียว'),h('p',null,data.write_access.reasons.join(' · ')),data.write_access.can_manage_settings?h('button',{onClick:()=>setSetup(true)},'ตั้งค่าเพื่อเปิดการแก้ไข'):h('p',null,'ติดต่อผู้ดูแลเพื่อเปิดการแก้ไขหรือปรับสิทธิ์บัญชี')),
  !data.brand_configured&&h('p',{className:'sdd-warning'},'ยังไม่ได้เลือกแท็กแบรนด์ในหน้าตั้งค่า ขณะนี้ค้นหาด้วยชื่อสินค้า SKU หรือ ID ได้'),

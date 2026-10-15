@@ -31,14 +31,14 @@ final class Admin {
             if ($hook !== 'toplevel_page_sdd-stock-price') { return; }
             wp_enqueue_style('sdd-stock-price', plugins_url('assets/app.css', SDD_FILE), [], SDD_VERSION);
             wp_enqueue_script('sdd-stock-price', plugins_url('assets/app.js', SDD_FILE), ['wp-element'], SDD_VERSION, true);
-            $config = ['api' => esc_url_raw(rest_url('sdd/v1/')), 'ajax' => admin_url('admin-ajax.php'), 'nonce' => wp_create_nonce('wp_rest'), 'login' => wp_login_url(admin_url('admin.php?page=sdd-stock-price')), 'back' => admin_url(), 'user' => wp_get_current_user()->display_name, 'currency' => get_woocommerce_currency(), 'canBulk' => current_user_can('sdd_bulk_edit'), 'canRollback' => current_user_can('sdd_rollback'), 'canSettings' => current_user_can('sdd_manage_settings'), 'canAudit' => current_user_can('sdd_view_audit'), 'canLogs' => current_user_can('sdd_view_system_logs'), 'version' => SDD_VERSION, 'timezone' => wp_timezone_string()];
+            $config = ['api' => esc_url_raw(rest_url('sdd/v1/')), 'ajax' => admin_url('admin-ajax.php'), 'nonce' => wp_create_nonce('wp_rest'), 'login' => wp_login_url(admin_url('admin.php?page=sdd-stock-price')), 'back' => admin_url(), 'user' => wp_get_current_user()->display_name, 'userId' => get_current_user_id(), 'currency' => get_woocommerce_currency(), 'canBulk' => current_user_can('sdd_bulk_edit'), 'canRollback' => current_user_can('sdd_rollback'), 'canSettings' => current_user_can('sdd_manage_settings'), 'canAudit' => current_user_can('sdd_view_audit'), 'canLogs' => current_user_can('sdd_view_system_logs'), 'version' => SDD_VERSION, 'timezone' => wp_timezone_string()];
             wp_add_inline_script('sdd-stock-price', 'window.SDD_CONFIG=' . wp_json_encode($config, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) . ';', 'before');
         });
         // Cookie-authenticated same-origin nonce refresh. No unauthenticated AJAX action is registered.
         add_action('wp_ajax_sdd_session', static function (): void {
             nocache_headers();
             if (!current_user_can('sdd_view_products')) { wp_send_json_error(['message' => 'สิทธิ์ไม่เพียงพอ'], 403); }
-            wp_send_json_success(['nonce' => wp_create_nonce('wp_rest')]);
+            wp_send_json_success(['nonce' => wp_create_nonce('wp_rest'), 'user_id' => get_current_user_id()]);
         });
         add_action('admin_notices', static function (): void {
             if (current_user_can('sdd_manage_settings') && !Schema::ready()) { echo '<div class="notice notice-error"><p>' . esc_html__('SoundDD schema ไม่พร้อม: หยุดการเขียน กรุณาตรวจแล้วเปิดใช้ปลั๊กอินใหม่', 'sdd-stock-price') . '</p></div>'; }
