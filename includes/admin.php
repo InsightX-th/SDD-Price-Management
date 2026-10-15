@@ -9,6 +9,7 @@ final class Admin {
     }
     public static function boot(): void {
         add_action('admin_init', static function():void {
+            Schema::upgradeRoleCapabilities();
             if (current_user_can('manage_options') && get_option('sdd_p3_caps')!=='1') {
                 $role=get_role('administrator');if ($role) { $role->add_cap('sdd_bulk_edit');$role->add_cap('sdd_rollback');update_option('sdd_p3_caps','1',false);wp_get_current_user()->get_role_caps(); }
             }

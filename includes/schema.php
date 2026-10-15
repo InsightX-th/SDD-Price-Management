@@ -131,9 +131,27 @@ final class Schema {
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
         foreach (self::definitions() as $sql) { dbDelta($sql); }
         if (self::ready(false)) { update_option('sdd_schema_version', self::VERSION, false); }
-        $role = get_role('administrator');
-        if ($role) { foreach (['sdd_view_products', 'sdd_edit_products', 'sdd_manage_settings', 'sdd_view_audit', 'sdd_view_system_logs', 'sdd_bulk_edit', 'sdd_rollback'] as $cap) { $role->add_cap($cap); } }
+        self::grantRoleCapabilities();
         add_option('sdd_settings', ['brand_ids' => [], 'confirmation_mode' => 'always', 'write_stop' => true, 'local_ack' => false], '', false);
+    }
+    /** Grant the plugin workflow to administrators and store managers; technical logs stay administrator-only. */
+    public static function grantRoleCapabilities(): void {
+        $administrator = get_role('administrator');
+        if ($administrator) {
+            foreach (['sdd_view_products', 'sdd_edit_products', 'sdd_manage_settings', 'sdd_view_audit', 'sdd_view_system_logs', 'sdd_bulk_edit', 'sdd_rollback'] as $cap) { $administrator->add_cap($cap); }
+        }
+        $shopManager = get_role('shop_manager');
+        if ($shopManager) {
+            foreach (['sdd_view_products', 'sdd_edit_products', 'sdd_manage_settings', 'sdd_view_audit', 'sdd_bulk_edit', 'sdd_rollback'] as $cap) { $shopManager->add_cap($cap); }
+        }
+    }
+    /** One-time upgrade migration for sites where plugin updates did not run the activation hook. */
+    public static function upgradeRoleCapabilities(): void {
+        if (!current_user_can('manage_options') || get_option('sdd_role_caps_version') === '1') { return; }
+        if (!get_role('administrator') || !get_role('shop_manager')) { return; }
+        self::grantRoleCapabilities();
+        update_option('sdd_role_caps_version', '1', false);
+        wp_get_current_user()->get_role_caps();
     }
     public static function ready(bool $version = true): bool {
         global $wpdb;
