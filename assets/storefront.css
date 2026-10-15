@@ -1,0 +1,26 @@
+/* Scope to product dates; readable emphasis without competing with the sale price. */
+.product .sale-end-date,
+.sdd-sale-date-slot .sale-end-date {
+ display: inline-block;
+ margin: 16px 0 10px;
+ padding: 5px 10px;
+ border: 1px solid #f4c5bf;
+ border-left: 3px solid #c43225;
+ border-radius: 5px;
+ background: #fff3f1;
+ color: #a52a20;
+ font-size: 18px;
+ font-weight: 600;
+ line-height: 1.5;
+ letter-spacing: normal;
+}
+.single-product .product .sale-end-date { font-size: 18px; }
+
+/* Keep the date badge content-sized across Flatsome card wrappers. */
+.product .box-text p.sale-end-date,
+.layout .box-text p.sale-end-date,
+.product-small .box-text p.sale-end-date {
+ height: auto !important;
+ min-height: 0 !important;
+ max-height: none !important;
+}
