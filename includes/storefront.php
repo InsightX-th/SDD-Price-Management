@@ -93,7 +93,7 @@ final class Storefront {
                 $running = self::active($child);
                 if (!$running) { return $html; }
                 $base = json_decode($running['original_json'], true);
-                $reference = json_decode($running['expected_json'], true)['_reference_price'] ?? TemporarySales::reference($base, (int)$running['starts_at'])['price'];
+                $reference = $base['regular_price'];
                 $old = wc_get_price_to_display($child, ['price' => $reference]);
                 $current = wc_get_price_to_display($child, ['price' => $running['sale_price']]);
                 if ($old <= $current) { return $html; }
@@ -106,7 +106,7 @@ final class Storefront {
         $plan = self::active($p);
         if (!$plan) { return $html; }
         $original = json_decode($plan['original_json'], true);
-        $reference = json_decode($plan['expected_json'], true)['_reference_price'] ?? TemporarySales::reference($original, (int)$plan['starts_at'])['price'];
+        $reference = $original['regular_price'];
         $old = wc_get_price_to_display($p, ['price' => $reference]);
         $current = wc_get_price_to_display($p, ['price' => $plan['sale_price']]);
         // A higher temporary price must not be presented as a discount.

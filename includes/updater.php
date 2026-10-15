@@ -5,6 +5,7 @@ namespace SDD;
 if (!defined('ABSPATH')) { exit; }
 
 final class Updater {
+    private static bool $booted = false;
     private const OWNER = 'InsightX-th';
     private const REPOSITORY = 'SDD-Price-Management';
     private const SLUG = 'sdd-stock-price';
@@ -12,36 +13,32 @@ final class Updater {
     private const RELEASE_ERROR_CACHE = 'sdd_stock_price_release_check_error';
 
     public static function boot(): void {
-        // Run before older updater libraries that assume response/no_update are arrays.
-        add_filter('pre_set_site_transient_update_plugins', [self::class, 'filterUpdates'], 1);
+        if (self::$booted) { return; }
+        self::$booted = true;
+        // WordPress dispatches Update URI checks through this host-specific hook.
+        add_filter('update_plugins_github.com', [self::class, 'updateUriResponse'], 10, 4);
+        // Normalize malformed collection containers before legacy updater callbacks run.
+        add_filter('pre_set_site_transient_update_plugins', [self::class, 'normalizeTransient'], 1);
         add_filter('plugins_api', [self::class, 'pluginInformation'], 10, 3);
     }
 
-    public static function filterUpdates(mixed $transient): mixed {
-        if (!is_object($transient) || empty($transient->checked) || !is_array($transient->checked)) { return $transient; }
-
-        $pluginFile = plugin_basename(SDD_FILE);
-        if (!array_key_exists($pluginFile, $transient->checked)) { return $transient; }
-
-        // WordPress and other plugins expect these collections to be arrays.
-        // Convert stale object-shaped values written by earlier updater code.
-        if (isset($transient->response) && is_object($transient->response)) { $transient->response = get_object_vars($transient->response); }
-        elseif (!isset($transient->response) || !is_array($transient->response)) { $transient->response = []; }
-        if (isset($transient->no_update) && is_object($transient->no_update)) { $transient->no_update = get_object_vars($transient->no_update); }
-        elseif (!isset($transient->no_update) || !is_array($transient->no_update)) { $transient->no_update = []; }
-
-        $release = self::latestRelease();
-        if ($release === null) { return $transient; }
-
-        $details = self::updateDetails($pluginFile, $release);
-        if (version_compare($release['version'], SDD_VERSION, '>')) {
-            $transient->response[$pluginFile] = $details;
-            unset($transient->no_update[$pluginFile]);
-        } else {
-            $transient->no_update[$pluginFile] = $details;
-            unset($transient->response[$pluginFile]);
+    public static function normalizeTransient(mixed $transient): mixed {
+        if (!is_object($transient)) { return $transient; }
+        foreach (['response','no_update'] as $collection) {
+            if (isset($transient->{$collection}) && is_object($transient->{$collection})) {
+                $transient->{$collection} = get_object_vars($transient->{$collection});
+            } elseif (!isset($transient->{$collection}) || !is_array($transient->{$collection})) {
+                $transient->{$collection} = [];
+            }
         }
         return $transient;
+    }
+
+    public static function updateUriResponse(mixed $update, array $pluginData, string $pluginFile, array $locales): array|false {
+        if ($pluginFile !== plugin_basename(SDD_FILE) || ($pluginData['UpdateURI'] ?? '') !== self::repositoryUrl()) { return $update; }
+        $release = self::latestRelease();
+        if ($release === null || version_compare($release['version'], SDD_VERSION, '<=')) { return false; }
+        return self::updateDetails($release);
     }
 
     public static function pluginInformation(mixed $result, string $action, object $args): mixed {
@@ -128,11 +125,10 @@ final class Updater {
         return $result;
     }
 
-    private static function updateDetails(string $pluginFile, array $release): object {
-        return (object)[
+    private static function updateDetails(array $release): array {
+        return [
             'slug' => self::SLUG,
-            'plugin' => $pluginFile,
-            'new_version' => $release['version'],
+            'version' => $release['version'],
             'url' => self::repositoryUrl(),
             'package' => $release['package'],
             'requires' => '6.8',

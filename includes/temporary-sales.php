@@ -25,8 +25,7 @@ final class TemporarySales {
     public static function snapshot(\WC_Product $p): array { return array_intersect_key(Policy::values($p), array_flip(['regular_price','sale_price','sale_dates'])); }
     public static function hasOriginalSale(array $base): bool { return isset($base['sale_price']) && $base['sale_price'] !== '' && $base['sale_price'] !== '0'; }
     public static function reference(array $base, int $at): array {
-        $sale = $base['sale_price'] ?? '';
-        return self::hasOriginalSale($base) ? ['price'=>$sale,'reason'=>'มีราคาโปรเดิม ใช้ราคาโปรเดิม'] : ['price'=>$base['regular_price'],'reason'=>'ไม่มีราคาโปรเดิม ใช้ราคาปกติ'];
+        return ['price'=>$base['regular_price'],'reason'=>'ใช้ราคาปกติเป็นราคาอ้างอิง'];
     }
     private static function native(): bool {
         return doing_action('wc_product_start_scheduled_sale') || doing_action('wc_product_end_scheduled_sale') || doing_action('woocommerce_scheduled_sales');
@@ -67,7 +66,8 @@ final class TemporarySales {
     }
     private static function row(string $id): ?array { global $wpdb; return $wpdb->get_row($wpdb->prepare('SELECT * FROM ' . self::table() . ' WHERE id=%s', $id), ARRAY_A) ?: null; }
     private static function publicRow(array $r): array {
-        return ['id' => $r['id'], 'product_id' => (string)$r['product_id'], 'status' => $r['status'], 'price' => $r['sale_price'], 'starts_at' => (string)$r['starts_at'], 'ends_at' => (string)$r['ends_at'], 'original' => json_decode($r['original_json'], true), 'message' => $r['message'], 'revive_expired' => (bool)(json_decode($r['expected_json'], true)['_revive_expired'] ?? false), 'reference_price' => json_decode($r['expected_json'], true)['_reference_price'] ?? self::reference(json_decode($r['original_json'], true), (int)$r['starts_at'])['price']];
+        $original = json_decode($r['original_json'], true);
+        return ['id' => $r['id'], 'product_id' => (string)$r['product_id'], 'status' => $r['status'], 'price' => $r['sale_price'], 'starts_at' => (string)$r['starts_at'], 'ends_at' => (string)$r['ends_at'], 'original' => $original, 'message' => $r['message'], 'revive_expired' => (bool)(json_decode($r['expected_json'], true)['_revive_expired'] ?? false), 'reference_price' => self::reference($original, (int)$r['starts_at'])['price']];
     }
     public static function listing(int $id): array|\WP_Error {
         if (!current_user_can('sdd_manage_settings') || !Policy::accessible($id, true)) { return API::error('forbidden', 'ไม่มีสิทธิ์จัดการโปรสินค้านี้', 403); }
@@ -134,7 +134,7 @@ final class TemporarySales {
             if ($revive && (!self::hasOriginalSale($base) || $originalEnd==='' || (int)$originalEnd>max(time(),$end))) { return API::error('invalid_input','ใช้ตัวเลือกนี้ได้เมื่อมีโปรเดิมที่หมดอายุภายในช่วงโปรชั่วคราว',400); }
             if ($base !== $in['baseline']) { return API::error('field_conflict', 'ราคาเปลี่ยนแล้ว โหลดข้อมูลและยืนยันใหม่', 409); }
             if ((int)$in['price'] >= (int)$base['regular_price'] || ($base['sale_price'] !== '' && (int)$base['sale_price'] >= (int)$base['regular_price']) || ($base['sale_price'] === '' && $base['sale_dates'] !== '|') || is_wp_error(Policy::normalizeDates($base['sale_dates']))) { return API::error('price_relation', 'ราคาโปรใหม่และเดิมต้องต่ำกว่าราคาปกติ ตารางเดิมต้องถูกต้อง', 400); }
-            if ((int)$in['price'] >= (int)self::reference($base, max(time(), $start))['price']) { return API::error('price_relation', 'ราคาโปรชั่วคราวต้องต่ำกว่าราคาที่มีผลก่อนเริ่มโปร', 400); }
+            if ((int)$in['price'] >= (int)self::reference($base, max(time(), $start))['price']) { return API::error('price_relation', 'ราคาโปรชั่วคราวต้องต่ำกว่าราคาปกติ', 400); }
             if ($wpdb->get_var($wpdb->prepare('SELECT id FROM ' . self::table() . " WHERE product_id=%d AND status IN ('pending','active','needs_review') LIMIT 1", $id))) { return API::error('promotion_exists', 'มีโปรที่รอเริ่ม/กำลังใช้/รอตรวจแล้ว ต้องปิดรายการเดิมก่อน', 409); }
             $now = gmdate('Y-m-d H:i:s');
             $row = ['id'=>$op,'product_id'=>$id,'actor_id'=>$actor,'payload_hash'=>$hash,'status'=>'pending','starts_at'=>$start,'ends_at'=>$end,'sale_price'=>$in['price'],'original_json'=>wp_json_encode($base),'expected_json'=>wp_json_encode(array_merge($base,['_revive_expired'=>$revive])),'start_operation'=>wp_generate_uuid4(),'end_operation'=>wp_generate_uuid4(),'message'=>'','created_at'=>$now,'updated_at'=>$now];

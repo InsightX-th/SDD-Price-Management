@@ -228,10 +228,10 @@ function TemporarySale({row,onSaved}){
   if(!data?.baseline||busy||d.state==='unknown')return;
   if(!/^(0|[1-9][0-9]{0,14})$/.test(d.price)||!d.start||!d.end||d.end<=d.start){setError('กรอกราคาเป็นจำนวนเต็ม พร้อมวันเริ่มและวันสิ้นสุด โดยวันสิ้นสุดต้องหลังวันเริ่ม');return;}
   const now=localMinute(Date.now()/1000),reference=referenceAt(data.baseline,d.start>now?d.start:now);
-  if(BigInt(d.price)>=BigInt(reference.price)){setError('ราคาโปรชั่วคราวต้องต่ำกว่าราคาอ้างอิง '+showValue(reference.price,'sale_price'));return;}
+  if(BigInt(d.price)>=BigInt(reference.price)){setError('ราคาโปรชั่วคราวต้องต่ำกว่าราคาปกติ '+showValue(reference.price,'regular_price'));return;}
   if([...drafts.entries()].some(([k,v])=>k.startsWith(row.id+':')&&v.state!=='clean')){setError('บันทึกหรือยกเลิกราคาที่แก้ค้างไว้ของสินค้านี้ ก่อนตั้งโปรชั่วคราว');return;}
   const restoreNote=!hasOriginalSale(data.baseline)?'ไม่มีราคาโปรเดิม เมื่อจบจะใช้ราคาปกติ '+showValue(data.baseline.regular_price,'regular_price'):d.revive&&canRevive(data.baseline,d.end)?'เลือกคืนราคาโปรเดิมแม้หมดอายุ: หลังจบจะล้างวันโปรเดิมทั้งเริ่มและจบ เพื่อให้ราคาโปรเดิมใช้งานต่อ':'เมื่อจบคืนราคาโปรเดิม '+showValue(data.baseline.sale_price,'sale_price')+' และวันเดิม '+showValue(data.baseline.sale_dates,'sale_dates')+' หากวันเดิมหมดอายุ จะใช้ราคาปกติ';
-  const summary='โปรชั่วคราวของ '+row.name+'\nราคาอ้างอิง '+showValue(reference.price,'sale_price')+' ('+reference.reason+') → '+showValue(d.price,'sale_price')+'\nเริ่ม '+d.start+' / จบ '+d.end+' ('+(cfg.timezone||'UTC')+')\n'+restoreNote+'\nหากราคา หรือวันโปรเปลี่ยนระหว่างทาง ระบบจะหยุดคืนราคาอัตโนมัติและแจ้งให้ตรวจสอบ\nหากงานอัตโนมัติทำงานช้าหรือหยุดการบันทึกไว้ โปรอาจเริ่มหรือคืนราคาช้า\nยืนยันตั้งโปรนี้?';
+  const summary='โปรชั่วคราวของ '+row.name+'\nราคาอ้างอิง '+showValue(reference.price,'regular_price')+' ('+reference.reason+') → '+showValue(d.price,'sale_price')+'\nเริ่ม '+d.start+' / จบ '+d.end+' ('+(cfg.timezone||'UTC')+')\n'+restoreNote+'\nหากราคา หรือวันโปรเปลี่ยนระหว่างทาง ระบบจะหยุดคืนราคาอัตโนมัติและแจ้งให้ตรวจสอบ\nหากงานอัตโนมัติทำงานช้าหรือหยุดการบันทึกไว้ โปรอาจเริ่มหรือคืนราคาช้า\nยืนยันตั้งโปรนี้?';
   if(!await confirmChange(summary))return;
   if(d.price==='0'&&!await confirmChange('ราคาโปรเป็นศูนย์ ยืนยันให้สินค้านี้ราคา 0?'))return;
   d.operation={operation_id:uuid(),price:d.price,start:d.start,end:d.end,baseline:data.baseline,confirmed:true,zero_ack:d.price==='0',revive_expired:!!d.revive&&canRevive(data.baseline,d.end)};d.state='saving';setBusy(true);setError('');
@@ -267,13 +267,13 @@ function localMinute(epoch){
 function hasOriginalSale(row){return row.sale_price!==''&&row.sale_price!=='0';}
 function canRevive(row,end){const to=(row.sale_dates||'|').split('|')[1];return hasOriginalSale(row)&&!!to&&localMinute(to)<=(end||localMinute(Date.now()/1000));}
 function referenceAt(row,at){
- return {price:hasOriginalSale(row)?row.sale_price:row.regular_price,reason:hasOriginalSale(row)?'มีราคาโปรเดิม ใช้ราคาโปรเดิม':'ไม่มีราคาโปรเดิม ใช้ราคาปกติ'};
+ return {price:row.regular_price,reason:'ใช้ราคาปกติเป็นราคาอ้างอิง'};
 }
 function restoredPrice(row,at){const [from,to]=(row.sale_dates||'|').split('|');return hasOriginalSale(row)&&(!from||localMinute(from)<=at)&&(!to||localMinute(to)>=at)?row.sale_price:row.regular_price;}
 function PlanSummary({row,price,dates,revive}){
  const [start,end]=(dates||'|').split('|'),now=localMinute(Date.now()/1000),reference=referenceAt(row,start&&start>now?start:now),after=revive?row.sale_price:restoredPrice(row,end||now);
  return h('section',{className:'sdd-plan-summary','aria-label':'สรุปผลโปร'},h('strong',null,'สรุปราคาก่อนยืนยัน'),
- [['ราคาเทียบส่วนลด',reference.price],['ระหว่างโปร',price===''?'':price],['หลังจบโปร',after]].flatMap(([label,value],index)=>[h('div',{className:'sdd-plan-stage',key:label},h('span',null,label),h('strong',null,showValue(value,'sale_price'))),index<2&&h('span',{className:'sdd-plan-arrow','aria-hidden':true,key:'arrow-'+index},'→')].filter(Boolean)),
+ [['ราคาปกติ',reference.price],['ระหว่างโปร',price===''?'':price],['หลังจบโปร',after]].flatMap(([label,value],index)=>[h('div',{className:'sdd-plan-stage',key:label},h('span',null,label),h('strong',null,showValue(value,label==='ราคาปกติ'?'regular_price':'sale_price'))),index<2&&h('span',{className:'sdd-plan-arrow','aria-hidden':true,key:'arrow-'+index},'→')].filter(Boolean)),
  h('div',{className:'sdd-plan-context',role:'group','aria-label':'รายละเอียดราคาอ้างอิง วันโปรเดิม และการคืนราคา'},h('span',null,reference.reason),h('span',null,showValue(dates,'sale_dates')+' · '+(cfg.timezone||'UTC')),h('span',null,revive?'หลังจบคืนโปรเดิมและล้างวันเริ่ม–จบเดิมเพื่อใช้โปรต่อ':'คืนราคาและตารางเดิม หากโปรเดิมหมดอายุใช้ราคาปกติ')));
 }
 
