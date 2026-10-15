@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: SoundDD Stock & Price
- * Description: Production-bound store product editor; this release is for Local testing.
+ * Description: Manage WooCommerce product prices, stock, and temporary promotions.
  * Version: 0.5.21
  * Requires at least: 6.8
  * Requires PHP: 8.2
