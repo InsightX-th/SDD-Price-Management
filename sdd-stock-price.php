@@ -2,7 +2,8 @@
 /**
  * Plugin Name: SoundDD Stock & Price
  * Description: Manage WooCommerce product prices, stock, and temporary promotions.
- * Version: 0.5.21
+ * Version: 0.5.22
+ * Update URI: https://github.com/InsightX-th/SDD-Price-Management
  * Requires at least: 6.8
  * Requires PHP: 8.2
  * Requires Plugins: woocommerce
@@ -13,11 +14,12 @@ declare(strict_types=1);
 namespace SDD;
 if (!defined('ABSPATH')) { exit; }
 define('SDD_FILE', __FILE__);
-define('SDD_VERSION', '0.5.21');
-foreach (['schema', 'policy', 'writer', 'bulk', 'catalog', 'feed', 'external-changes', 'workspace-sync', 'temporary-sales', 'storefront', 'inspection', 'system-logs', 'retention', 'api', 'admin'] as $module) { require_once __DIR__ . '/includes/' . $module . '.php'; }
+define('SDD_VERSION', '0.5.22');
+foreach (['schema', 'policy', 'writer', 'bulk', 'catalog', 'feed', 'external-changes', 'workspace-sync', 'temporary-sales', 'storefront', 'inspection', 'system-logs', 'retention', 'api', 'admin', 'updater'] as $module) { require_once __DIR__ . '/includes/' . $module . '.php'; }
 register_activation_hook(__FILE__, [Schema::class, 'activate']);
 register_deactivation_hook(__FILE__, static function (): void { wp_clear_scheduled_hook('sdd_feed_publish');wp_clear_scheduled_hook('sdd_external_drain');wp_clear_scheduled_hook('sdd_log_retention');wp_clear_scheduled_hook('sdd_business_retention'); });
 add_action('plugins_loaded', static function (): void {
+    Updater::boot();
     if (!class_exists('WooCommerce') || version_compare(PHP_VERSION, '8.2', '<')) {
         add_action('admin_notices', static function (): void { echo '<div class="notice notice-error"><p>' . esc_html__('SoundDD ต้องใช้ WooCommerce และ PHP 8.2 ขึ้นไป', 'sdd-stock-price') . '</p></div>'; });
         return;
