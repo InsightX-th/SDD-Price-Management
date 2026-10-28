@@ -29,8 +29,8 @@ final class Admin {
         });
         add_action('admin_enqueue_scripts', static function ($hook): void {
             if ($hook !== 'toplevel_page_sdd-stock-price') { return; }
-            wp_enqueue_style('sdd-stock-price', plugins_url('assets/app.css', SDD_FILE), [], SDD_VERSION);
-            wp_enqueue_script('sdd-stock-price', plugins_url('assets/app.js', SDD_FILE), ['wp-element'], SDD_VERSION, true);
+            wp_enqueue_style('sdd-stock-price', plugins_url('assets/app.css', SDD_FILE), [], SDD_VERSION . '.' . filemtime(dirname(SDD_FILE) . '/assets/app.css'));
+            wp_enqueue_script('sdd-stock-price', plugins_url('assets/app.js', SDD_FILE), ['wp-element'], SDD_VERSION . '.' . filemtime(dirname(SDD_FILE) . '/assets/app.js'), true);
             $config = ['api' => esc_url_raw(rest_url('sdd/v1/')), 'ajax' => admin_url('admin-ajax.php'), 'nonce' => wp_create_nonce('wp_rest'), 'login' => wp_login_url(admin_url('admin.php?page=sdd-stock-price')), 'back' => admin_url(), 'user' => wp_get_current_user()->display_name, 'userId' => get_current_user_id(), 'currency' => get_woocommerce_currency(), 'canBulk' => current_user_can('sdd_bulk_edit'), 'canRollback' => current_user_can('sdd_rollback'), 'canSettings' => current_user_can('sdd_manage_settings'), 'canAudit' => current_user_can('sdd_view_audit'), 'canLogs' => current_user_can('sdd_view_system_logs'), 'version' => SDD_VERSION, 'timezone' => wp_timezone_string()];
             wp_add_inline_script('sdd-stock-price', 'window.SDD_CONFIG=' . wp_json_encode($config, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) . ';', 'before');
         });
@@ -48,5 +48,6 @@ final class Admin {
         if (!current_user_can('sdd_view_products')) { wp_die(esc_html__('สิทธิ์ไม่เพียงพอ', 'sdd-stock-price')); }
         nocache_headers();
         echo '<div id="sdd-root"><p>' . esc_html__('กำลังโหลด SoundDD…', 'sdd-stock-price') . '</p></div>';
+        echo '<footer class="sdd-powered-footer"><div class="sdd-powered-inner"><span class="sdd-footer-name">SoundDD <span>Stock &amp; Price</span></span><div class="sdd-powered-credit"><span>Powered by</span><a href="https://insightx.in.th/" target="_blank" rel="noopener noreferrer" aria-label="InsightX (opens in a new tab)"><img src="' . esc_url(plugins_url('assets/isx-logo.svg', SDD_FILE)) . '" alt="InsightX" width="86" height="24"></a></div></div></footer>';
     }
 }
