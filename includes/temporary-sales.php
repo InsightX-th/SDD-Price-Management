@@ -177,7 +177,7 @@ final class TemporarySales {
             if ($cancel && $r['status'] !== 'active') { self::update($id,['status'=>'cancelled','message'=>$r['status']==='needs_review'?'ปิดรายการตรวจสอบแล้ว คงราคาปัจจุบัน':'ยกเลิกก่อนเริ่ม']); return ['ok'=>true,'promotion'=>self::publicRow(self::row($id))]; }
             if ($r['status'] === 'needs_review') { return API::error('needs_review',$r['message'],409); }
             if (!$cancel && (($r['status']==='pending' && (int)$r['starts_at']>time()) || ($r['status']==='active' && (int)$r['ends_at']>time()))) { return ['ok'=>true,'promotion'=>self::publicRow($r)]; }
-            if ($r['status']==='pending' && (int)$r['ends_at']<=time()) { self::update($id,['status'=>'missed','message'=>'เลยเวลาจบก่อนเริ่ม ไม่เปลี่ยนราคา']); return ['ok'=>true,'promotion'=>self::publicRow(self::row($id))]; }
+            if ($r['status']==='pending' && (int)$r['ends_at']<=time()) { self::update($id,['status'=>'needs_review','message'=>'เลยเวลาจบก่อนเริ่ม ไม่เปลี่ยนราคา กรุณาตรวจสอบและปิดรายการ']); return ['ok'=>true,'promotion'=>self::publicRow(self::row($id))]; }
             if ($reasons=Policy::globalReasons()) { self::update($id,['message'=>implode('; ',$reasons).' — รอประมวลผล รวมถึงการคืนราคา']); return API::error('write_unavailable',implode('; ',$reasons),503); }
             wp_set_current_user((int)$r['actor_id']);
             $pid=(int)$r['product_id'];

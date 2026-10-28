@@ -26,6 +26,9 @@ final class API {
     }
     public static function register(): void {
         $routes = [
+            ['/promotion-alerts', 'GET', static fn($r) => Dashboard::alerts($r->get_query_params()), 'sdd_manage_settings'],
+            ['/promotion-calendar', 'GET', static fn($r) => Dashboard::calendar($r->get_query_params()), 'sdd_manage_settings'],
+            ['/dashboard', 'GET', static fn($r) => Dashboard::read($r->get_query_params()), 'sdd_manage_settings'],
             ['/health', 'GET', static fn($r) => Inspection::health($r->get_query_params()), 'sdd_manage_settings'],
             ['/audit', 'GET', static fn($r) => Inspection::audit($r->get_query_params()), 'sdd_view_audit'],
             ['/logs', 'GET', static fn($r) => SystemLogs::listing($r->get_query_params()), 'sdd_view_system_logs'],
