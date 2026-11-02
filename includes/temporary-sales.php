@@ -67,7 +67,7 @@ final class TemporarySales {
     private static function row(string $id): ?array { global $wpdb; return $wpdb->get_row($wpdb->prepare('SELECT * FROM ' . self::table() . ' WHERE id=%s', $id), ARRAY_A) ?: null; }
     private static function publicRow(array $r): array {
         $original = json_decode($r['original_json'], true);
-        return ['id' => $r['id'], 'product_id' => (string)$r['product_id'], 'status' => $r['status'], 'price' => $r['sale_price'], 'starts_at' => (string)$r['starts_at'], 'ends_at' => (string)$r['ends_at'], 'original' => $original, 'message' => $r['message'], 'revive_expired' => (bool)(json_decode($r['expected_json'], true)['_revive_expired'] ?? false), 'reference_price' => self::reference($original, (int)$r['starts_at'])['price']];
+        return ['id' => $r['id'], 'product_id' => (string)$r['product_id'], 'status' => $r['status'], 'price' => $r['sale_price'], 'starts_at' => (string)$r['starts_at'], 'ends_at' => (string)$r['ends_at'], 'original' => $original, 'message' => $r['message'], 'updated_at' => str_replace(' ', 'T', $r['updated_at']) . 'Z', 'revive_expired' => (bool)(json_decode($r['expected_json'], true)['_revive_expired'] ?? false), 'reference_price' => self::reference($original, (int)$r['starts_at'])['price']];
     }
     public static function listing(int $id): array|\WP_Error {
         if (!current_user_can('sdd_manage_settings') || !Policy::accessible($id, true)) { return API::error('forbidden', 'ไม่มีสิทธิ์จัดการโปรสินค้านี้', 403); }
@@ -75,7 +75,7 @@ final class TemporarySales {
         global $wpdb;
         $rows = $wpdb->get_results($wpdb->prepare('SELECT * FROM ' . self::table() . ' WHERE product_id=%d ORDER BY created_at DESC,id DESC LIMIT 5', $id), ARRAY_A);
         $p = Writer::fresh($id);
-        return ['items' => array_map([self::class,'publicRow'], $rows), 'baseline' => $p ? self::snapshot($p) : null, 'timezone' => wp_timezone_string(), 'server_time' => (string)time()];
+        return ['items' => array_map([self::class,'publicRow'], $rows), 'baseline' => $p ? self::snapshot($p) : null, 'current_price' => $p ? $p->get_price('edit') : null, 'automation' => ['blocked' => (bool)Policy::globalReasons()], 'timezone' => wp_timezone_string(), 'server_time' => (string)time()];
     }
     private static function uuid(mixed $s): bool { return is_string($s) && preg_match('/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/D', $s) === 1; }
     private static function parseTime(mixed $s): ?int {
