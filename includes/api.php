@@ -26,6 +26,17 @@ final class API {
     }
     public static function register(): void {
         $routes = [
+            ['/cache-connection', 'POST', static fn($r) => CloudflareClient::connect($r->get_json_params()), 'manage_options'],
+            ['/cache-settings', 'GET', static fn() => CachePurge::configResponse(), 'manage_options'],
+            ['/cache-settings', 'POST', static fn($r) => CachePurge::saveSettings($r->get_json_params()), 'manage_options'],
+            ['/cache-health', 'GET', static fn() => CachePurge::health(), 'manage_options'],
+            ['/cache-updates/(?P<id>[1-9][0-9]{0,17})/retry', 'POST', static fn($r) => CachePurge::retry((int)$r['id']), 'manage_options'],
+            ['/cache-updates', 'GET', static function($r) {
+                $in=$r->get_query_params();
+                if (array_diff(array_keys($in),['ids']) || !is_string($in['ids']??null) || strlen($in['ids'])>2000 || !preg_match('/^[1-9][0-9]{0,17}(,[1-9][0-9]{0,17}){0,99}$/D',$in['ids'])) { return self::error('invalid_query','ระบุรหัสสินค้าไม่เกิน 100 รายการ',400); }
+                $ids=array_values(array_filter(array_map('intval',explode(',',$in['ids'])),static fn($id)=>Policy::accessible($id)));
+                return ['items'=>(object)CachePurge::statuses($ids)];
+            }, 'sdd_view_products'],
             ['/promotion-alerts', 'GET', static fn($r) => Dashboard::alerts($r->get_query_params()), 'sdd_manage_settings'],
             ['/promotion-calendar', 'GET', static fn($r) => Dashboard::calendar($r->get_query_params()), 'sdd_manage_settings'],
             ['/dashboard', 'GET', static fn($r) => Dashboard::read($r->get_query_params()), 'sdd_manage_settings'],
@@ -50,7 +61,7 @@ final class API {
             ['/categories', 'GET', static fn($r) => self::terms('product_cat', (int) ($r['page'] ?? 1), false), 'sdd_view_products'],
             ['/brand-terms', 'GET', static fn($r) => self::terms('product_tag', (int) ($r['page'] ?? 1), false), 'sdd_manage_settings'],
             ['/settings', 'GET', static fn() => self::settingsResponse(), 'sdd_manage_settings'],
-            ['/settings', 'POST', [self::class, 'saveSettings'], 'sdd_manage_settings'],
+            ['/settings', 'POST', [self::class, 'saveSettings'], 'manage_options'],
             ['/session', 'GET', static fn() => ['ok' => true, 'nonce' => wp_create_nonce('wp_rest')], 'sdd_view_products'],
             ['/products/(?P<id>[1-9][0-9]{0,17})/field', 'POST', static function ($r) { $input = self::writeInput($r->get_json_params()); return is_wp_error($input) ? $input : Writer::execute((int) $r->get_url_params()['id'], $input); }, 'sdd_edit_products'],
             ['/operations/(?P<id>[a-f0-9-]{36})', 'GET', [self::class, 'operation'], 'sdd_view_products'],
@@ -89,6 +100,7 @@ final class API {
     }
     public static function settingsResponse(): array { return ['settings' => Policy::settings(), 'schema_ready' => Schema::ready(), 'currency' => get_woocommerce_currency(), 'prices_include_tax' => wc_prices_include_tax(), 'php' => PHP_VERSION, 'version' => SDD_VERSION]; }
     public static function saveSettings(\WP_REST_Request $r): array|\WP_Error {
+        if (!current_user_can('manage_options')) { return self::error('forbidden', 'เฉพาะผู้ดูแลเว็บไซต์ที่เปลี่ยนการตั้งค่าร้านได้', 403); }
         $in = $r->get_json_params();
         if (!is_array($in) || array_diff(array_keys($in), ['brand_ids','write_stop','local_ack']) || !isset($in['brand_ids'],$in['write_stop'],$in['local_ack']) || !is_array($in['brand_ids']) || !array_is_list($in['brand_ids']) || count($in['brand_ids']) > 500 || !is_bool($in['write_stop']) || !is_bool($in['local_ack'])) { return self::error('invalid_settings', 'ข้อมูลตั้งค่าไม่ถูกต้อง', 400); }
         $ids = [];

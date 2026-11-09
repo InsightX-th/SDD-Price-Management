@@ -71,6 +71,10 @@ final class Writer {
         $parentId = get_post_type($id) === 'product_variation' ? (int)get_post_field('post_parent', $id) : 0;
         $productIds = array_values(array_unique(array_filter([$parentId,$id]))); sort($productIds, SORT_NUMERIC);
         $queueBefore = (array)($GLOBALS['wc_deferred_product_sync'] ?? []);
+        // Prepare discovery outside the price transaction and product locks.
+        if (CachePurge::settings()['capture_enabled']) {
+            try { CacheDiscovery::inventory(); } catch (\Throwable) { return API::error('cache_discovery_unavailable','ยังตรวจหน้าที่แสดงสินค้าไม่ได้ กรุณาลองอีกครั้ง',503); }
+        }
         self::$active = true;
         $previousErrors = $wpdb->suppress_errors(true);
         try {
@@ -157,6 +161,7 @@ final class Writer {
                             $event = (string)$wpdb->insert_id;
                             self::update($states, ['revision' => (int)$before + 1, 'last_known_value' => $targetValue, 'last_event_id' => $event, 'updated_at' => $now], ['product_id' => $id, 'field' => $targetField]);
                         }
+                        CachePurge::capture($id, $parentId, $item, $op, $bundle['source'] ?? 'inline');
                         $revision = self::revision($id, $field);
                         self::update($items, ['event_id' => $event], ['item_id' => $item]);
                     }
@@ -167,13 +172,14 @@ final class Writer {
             }
             $commitAttempted = true; self::sql('COMMIT'); $transaction = false;
             self::fresh($id);
+            CachePurge::kick(); // This helper catches its own failures after the commit.
             return $result;
         } catch (\Throwable $e) {
             $rolledBack = $transaction && !$commitAttempted && $wpdb->query('ROLLBACK') !== false;
             $transaction = false; self::fresh($id);
             API::log('writer_failure');
             // Durable processing state is deliberately retained for operator reconciliation.
-            return API::error('operation_unknown', $rolledBack ? 'ยกเลิก transaction แล้ว แต่ต้องตรวจสถานะคำสั่งก่อนดำเนินการต่อ' : 'ไม่สามารถยืนยันผลคำสั่งได้ กรุณาหยุดและให้ผู้ดูแลตรวจสอบ', 409, ['operation_id' => $op]);
+            return API::error('operation_unknown', $rolledBack ? (str_starts_with($e->getMessage(), 'cache_') ? 'ยกเลิกการบันทึกราคา เนื่องจากเก็บงานอัปเดตหน้าร้านไม่สำเร็จ ให้ผู้ดูแลตรวจคิวและสถานะคำสั่งก่อนลองใหม่' : 'ยกเลิก transaction แล้ว แต่ต้องตรวจสถานะคำสั่งก่อนดำเนินการต่อ') : 'ไม่สามารถยืนยันผลคำสั่งได้ กรุณาหยุดและให้ผู้ดูแลตรวจสอบ', 409, ['operation_id' => $op]);
         } finally {
             if ($transaction) { $wpdb->query('ROLLBACK'); }
             foreach (array_reverse($locks) as $lock) { $wpdb->get_var($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock)); }

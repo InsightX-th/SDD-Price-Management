@@ -60,6 +60,7 @@ final class Dashboard {
         $health=Inspection::health([]);
         if (is_wp_error($health)) { return $health; }
         return [
+            'cache_updates'=>CachePurge::summary(),
             'problems'=>self::group($problems,static fn($r)=>['status'=>$r['status'],'message'=>$r['message']?:($r['status']==='needs_review'?'โปรต้องตรวจสอบ กรุณาตรวจราคาและประวัติ':($r['status']==='pending'?'เลยเวลาเริ่มโปรมากกว่า 5 นาที':'เลยเวลาคืนราคามากกว่า 5 นาที'))]),
             'upcoming'=>self::group($upcoming,static fn($r)=>['event_type'=>$r['event_type'],'at'=>(int)$r['event_at']]),
             'changes'=>self::group($changes,static fn($r)=>['field'=>$r['field'],'old_value'=>$r['old_value'],'new_value'=>$r['new_value'],'at'=>str_replace(' ','T',$r['created_at']).'Z']),

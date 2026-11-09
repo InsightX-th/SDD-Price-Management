@@ -57,6 +57,6 @@ final class WorkspaceSync {
             }
             if($others){$presence[(string)$id]=$others;}
         }
-        return ['items'=>Catalog::snapshots($visible),'unavailable'=>array_map('strval',array_values(array_diff($ids,$visible))),'presence'=>(object)$presence,'server_time'=>gmdate('Y-m-d\TH:i:s\Z'),'interval_seconds'=>15];
+        return ['items'=>Catalog::snapshots($visible),'unavailable'=>array_map('strval',array_values(array_diff($ids,$visible))),'presence'=>(object)$presence,'cache_updates'=>(object)CachePurge::statuses($visible),'server_time'=>gmdate('Y-m-d\TH:i:s\Z'),'interval_seconds'=>15];
     }
 }
