@@ -5,7 +5,7 @@ namespace SDD;
 /** Bounded, source-scoped access to WooCommerce's technical logs. */
 final class SystemLogs {
     public const SOURCE = 'sdd-stock-price';
-    private const EVENTS = ['writer_failure','schema_failure','publication_failure','external_observation_failure','external_reduction_failure'];
+    private const EVENTS = ['writer_failure','schema_failure','publication_failure','external_observation_failure','external_reduction_failure','cache_settings_changed','cache_retry_requested','cache_scheduler_failure','cache_purge_failure'];
     private const MAX_FILE_BYTES = 5242880;
     private const RETENTION_DAYS = 30;
     private const DAILY_EMISSION_LIMIT = 100;

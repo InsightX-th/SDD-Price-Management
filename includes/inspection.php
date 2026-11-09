@@ -43,11 +43,13 @@ final class Inspection {
             $queues['promotions_review']=self::sample('temporary_sales',"status='needs_review'",'status,starts_at,ends_at');
             $queues['live_promotions']=self::sample('temporary_sales',"status IN ('pending','active')",'status,starts_at,ends_at');
         }
+        $cache=CachePurge::summary();
         $logger=self::loggerStatus();
         $checks=[
             ['key'=>'schema','label'=>'โครงสร้างฐานข้อมูล','state'=>$ready?'ok':'blocked','detail'=>$ready?'พร้อม · ฐานข้อมูลรุ่น '.Schema::VERSION:'ฐานข้อมูลยังไม่พร้อม จึงหยุดการบันทึกไว้'],
             ['key'=>'writer','label'=>'เงื่อนไขการบันทึก','state'=>$ready&&!$reasons?'ok':'blocked','detail'=>$ready&&!$reasons?'พร้อมบันทึก โดยตรวจสิทธิ์และข้อจำกัดของสินค้าแต่ละรายการอีกครั้ง':implode(' · ',$reasons?:['ฐานข้อมูลยังไม่พร้อม'])],
             ['key'=>'cache','label'=>'Object cache','state'=>wp_using_ext_object_cache()?'blocked':'ok','detail'=>wp_using_ext_object_cache()?'พบระบบแคชข้อมูลถาวร (Object cache) ซึ่งปลั๊กอินรุ่นนี้ยังไม่รองรับ':'ใช้ cache ปกติของ WordPress'],
+            ['key'=>'cloudflare','label'=>'อัปเดตราคาหน้าร้าน','state'=>$cache['state']==='disabled'?'idle':($cache['state']==='unavailable'||$cache['attention']||($cache['pending']&&!$cache['dispatch_enabled'])?'warning':'ok'),'detail'=>$cache['state']==='disabled'?'ยังไม่เปิด Auto Purge':('งานค้าง '.$cache['pending'].' · ต้องตรวจสอบ '.$cache['attention'].($cache['dry_run']?' · โหมดทดลอง ไม่ส่ง Cloudflare':' · ส่งคำขอจริง'))],
             ['key'=>'logger','label'=>'Technical log','state'=>$logger['state'],'detail'=>$logger['detail']],
         ];
         foreach ($queues as $key=>$sample) {

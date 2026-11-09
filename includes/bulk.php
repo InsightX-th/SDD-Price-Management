@@ -106,7 +106,7 @@ final class Bulk {
         }
         $pending=$counts['pending']??0;$unknown=$counts['unknown']??0;$expired=strtotime($op['expires_at'].' UTC')<=time();
         $status=$unknown?'needs_reconciliation':($pending?($expired?'expired':($op['status']==='preview'?'preview':'running')):(($counts['failed']??0)+($counts['conflict']??0)>0?'completed_with_errors':'completed'));
-        return ['operation_id'=>$id,'kind'=>$op['kind'],'payload_hash'=>$op['payload_hash'],'expires_at'=>str_replace(' ','T',$op['expires_at']).'Z','status'=>$status,'progress'=>$counts,'pending'=>$pending,'unknown'=>$unknown,'items'=>$items,'params'=>$preview['params']];
+        return ['operation_id'=>$id,'kind'=>$op['kind'],'payload_hash'=>$op['payload_hash'],'expires_at'=>str_replace(' ','T',$op['expires_at']).'Z','status'=>$status,'progress'=>$counts,'pending'=>$pending,'unknown'=>$unknown,'items'=>$items,'params'=>$preview['params'],'cache_updates'=>CachePurge::operationSummary(array_column($preview['items'],'child_operation'))];
     }
     public static function execute(string $id,mixed $in): array|\WP_Error {
         global $wpdb;$op=self::owned($id);if (is_wp_error($op)) { return $op; }

@@ -20,7 +20,7 @@ final class Retention {
         global $wpdb;$ops=Schema::table('operations');$items=Schema::table('operation_items');$started=false;
         try{
             if($wpdb->query('START TRANSACTION')===false){return 0;}$started=true;
-            $ids=$wpdb->get_col($wpdb->prepare("SELECT o.operation_id FROM $ops o WHERE o.status IN ('completed','completed_with_errors') AND o.updated_at<%s AND NOT EXISTS (SELECT 1 FROM $items i WHERE i.operation_id=o.operation_id AND i.status IN ('pending','processing','unknown')) ORDER BY o.updated_at,o.operation_id LIMIT ".self::OPERATION_BATCH.' FOR UPDATE',$cutoff));
+            $ids=$wpdb->get_col($wpdb->prepare("SELECT o.operation_id FROM $ops o WHERE o.status IN ('completed','completed_with_errors') AND o.updated_at<%s AND NOT EXISTS (SELECT 1 FROM $items i WHERE i.operation_id=o.operation_id AND i.status IN ('pending','processing','unknown')) ".CachePurge::protectsOperation()." ORDER BY o.updated_at,o.operation_id LIMIT ".self::OPERATION_BATCH.' FOR UPDATE',$cutoff));
             if($wpdb->last_error){throw new \RuntimeException();}
             if(!$ids){$wpdb->query('COMMIT');return 0;}
             $ids=array_values(array_filter(array_map('strval',$ids),static fn($id)=>preg_match('/^[a-f0-9-]{36}$/D',$id)===1));
