@@ -8,12 +8,29 @@ const json = (data, status=200, nonce) => new Response(JSON.stringify(data), {st
 const html = status => new Response('<!DOCTYPE html><title>Access denied</title>', {status});
 function setup(handler) {
  const calls=[], events=[];
- const context = vm.createContext({cfg:{api:'/wp-json/sdd/v1/',ajax:'/wp-admin/admin-ajax.php',nonce:'old',userId:7},AbortController,setTimeout,clearTimeout,CustomEvent:class {constructor(type,options){this.type=type;this.detail=options.detail;}},window:{dispatchEvent:e=>events.push(e)},fetch:async(url,options)=>{calls.push({url,options});return handler(url,options,calls.length);}});
+ const context = vm.createContext({cfg:{api:'/wp-json/sdd/v1/',ajax:'/wp-admin/admin-ajax.php',nonce:'old',userId:7},AbortController,FormData,setTimeout,clearTimeout,CustomEvent:class {constructor(type,options){this.type=type;this.detail=options.detail;}},window:{dispatchEvent:e=>events.push(e)},fetch:async(url,options)=>{calls.push({url,options});return handler(url,options,calls.length);}});
  vm.runInContext("let nonce=cfg.nonce;\n"+client+"\nthis.client={api,renewNonce,reconnect:async()=>{await renewNonce();connectionError=null;}}",context);
  return {...context.client,calls,events};
 }
 const tests=[];
 const test=(name,fn)=>tests.push([name,fn]);
+test('CSV preview sends multipart data and lets the browser add its boundary',async()=>{
+ const file=new FormData();file.append('file',new Blob(['product_name,sale_price,starts_at,ends_at']),'promo.csv');
+ const s=setup((url,options)=>{
+  assert.ok(url.endsWith('/promotion-import'));
+  assert.equal(options.body,file);
+  assert.equal(options.headers['Content-Type'],undefined);
+  assert.equal(options.headers['X-WP-Nonce'],'old');
+  return json({batch:null,errors:[],rows:[]});
+ });
+ await s.api('promotion-import',file);
+});
+test('malformed CSV preview response does not imply an unknown promotion write',async()=>{
+ const file=new FormData();file.append('file',new Blob(['csv']),'promo.csv');
+ const s=setup(()=>html(200));
+ await assert.rejects(s.api('promotion-import',file),{code:'invalid_response'});
+ assert.equal(s.calls.length,1);
+});
 test('fresh REST nonce is used by the next request',async()=>{
  const s=setup((u,o,n)=>{assert.equal(o.headers['X-WP-Nonce'],n===1?'old':'fresh');return json({ok:true},200,'fresh');});
  await s.api('products');await s.api('brands');assert.equal(s.calls.length,2);
@@ -56,5 +73,10 @@ test('a repeated nonce rejection stops after one retry',async()=>{
 test('manual reconnect resumes requests after successful cookie authentication',async()=>{
  let blocked=true;
  const s=setup(u=>u.includes('admin-ajax')?json({success:true,data:{nonce:'new',user_id:7}}):blocked?html(403):json({ok:true}));await assert.rejects(s.api('products'));blocked=false;await s.reconnect();assert.equal((await s.api('products')).ok,true);assert.equal(s.calls.length,3);
+});
+test('network failures show useful Thai wording without replaying a write',async()=>{
+ const s=setup(()=>{throw new Error('signal is aborted without reason');});
+ await assert.rejects(s.api('products'),e=>e.code==='network_unavailable'&&/รีเฟรช/.test(e.message)&&!e.message.includes('aborted'));
+ await assert.rejects(s.api('products/1/field',{operation_id:'same'}),e=>e.code==='operation_unknown'&&/คำสั่งเดิม/.test(e.message));assert.equal(s.calls.length,2);
 });
 (async()=>{for(const [name,fn] of tests){await fn();console.log('PASS '+name);}console.log(tests.length+' scenarios passed');})().catch(e=>{console.error(e);process.exitCode=1;});

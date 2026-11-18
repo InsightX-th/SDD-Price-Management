@@ -29,14 +29,35 @@ final class API {
             ['/cache-connection', 'POST', static fn($r) => CloudflareClient::connect($r->get_json_params()), 'manage_options'],
             ['/cache-settings', 'GET', static fn() => CachePurge::configResponse(), 'manage_options'],
             ['/cache-settings', 'POST', static fn($r) => CachePurge::saveSettings($r->get_json_params()), 'manage_options'],
-            ['/cache-health', 'GET', static fn() => CachePurge::health(), 'manage_options'],
+            ['/cache-health', 'GET', static function($r) {
+                $query = $r->get_query_params();
+                $page = $query['page'] ?? '1';
+                $filter = $query['filter'] ?? 'all';
+                if (array_diff(array_keys($query), ['page', 'filter']) || !is_scalar($page) || !preg_match('/^[1-9][0-9]{0,5}$/D', (string)$page) || !is_string($filter) || !in_array($filter, ['all', 'attention', 'pending'], true)) {
+                    return self::error('invalid_query', 'ตรวจหน้ารายการและตัวกรองงานอีกครั้ง', 400);
+                }
+                return CachePurge::health((int)$page, $filter);
+            }, 'manage_options'],
             ['/cache-updates/(?P<id>[1-9][0-9]{0,17})/retry', 'POST', static fn($r) => CachePurge::retry((int)$r['id']), 'manage_options'],
+            ['/cache-updates/(?P<id>[1-9][0-9]{0,17})/close', 'POST', static function($r) {
+                $input = $r->get_json_params();
+                if (!is_array($input) || array_keys($input) !== ['confirmed'] || $input['confirmed'] !== true) {
+                    return self::error('confirmation_required', 'ยืนยันการปิดงานอัปเดตหน้าร้านก่อนดำเนินการ', 400);
+                }
+                return CachePurge::close((int)$r['id']);
+            }, 'manage_options'],
             ['/cache-updates', 'GET', static function($r) {
                 $in=$r->get_query_params();
                 if (array_diff(array_keys($in),['ids']) || !is_string($in['ids']??null) || strlen($in['ids'])>2000 || !preg_match('/^[1-9][0-9]{0,17}(,[1-9][0-9]{0,17}){0,99}$/D',$in['ids'])) { return self::error('invalid_query','ระบุรหัสสินค้าไม่เกิน 100 รายการ',400); }
                 $ids=array_values(array_filter(array_map('intval',explode(',',$in['ids'])),static fn($id)=>Policy::accessible($id)));
                 return ['items'=>(object)CachePurge::statuses($ids)];
             }, 'sdd_view_products'],
+            ['/promotion-import', 'POST', [TemporarySales::class,'importPreview'], 'sdd_bulk_edit'],
+            ['/promotion-import/(?P<id>[a-f0-9-]{36})', 'GET', static fn($r) => TemporarySales::importStatus($r->get_url_params()['id']), 'sdd_bulk_edit'],
+            ['/promotion-import/(?P<id>[a-f0-9-]{36})', 'POST', static fn($r) => TemporarySales::importConfirm($r->get_url_params()['id'], $r->get_json_params()['revision'] ?? null), 'sdd_bulk_edit'],
+            ['/promotion-import/(?P<id>[a-f0-9-]{36})/search', 'GET', static fn($r) => TemporarySales::importSearch($r->get_url_params()['id'],$r->get_query_params()['q'] ?? null,(int)($r->get_query_params()['row'] ?? 0)), 'sdd_bulk_edit'],
+            ['/promotion-import/(?P<id>[a-f0-9-]{36})/selection', 'POST', static fn($r) => TemporarySales::importSelect($r->get_url_params()['id'],$r->get_json_params()), 'sdd_bulk_edit'],
+            ['/promotion-import/(?P<id>[a-f0-9-]{36})/cancel', 'POST', static fn($r) => TemporarySales::importCancel($r->get_url_params()['id']), 'sdd_bulk_edit'],
             ['/promotion-alerts', 'GET', static fn($r) => Dashboard::alerts($r->get_query_params()), 'sdd_manage_settings'],
             ['/promotion-calendar', 'GET', static fn($r) => Dashboard::calendar($r->get_query_params()), 'sdd_manage_settings'],
             ['/dashboard', 'GET', static fn($r) => Dashboard::read($r->get_query_params()), 'sdd_manage_settings'],

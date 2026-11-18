@@ -126,26 +126,600 @@ final class TemporarySales {
             }
             if ($wpdb->get_var($wpdb->prepare('SELECT operation_id FROM ' . Schema::table('operations') . ' WHERE operation_id=%s', $op))) { return API::error('operation_payload_mismatch', 'รหัสคำสั่งถูกใช้แล้ว', 409); }
             if ($end <= time()) { return API::error('invalid_dates', 'เวลาจบต้องยังไม่ผ่าน หากเวลาเริ่มผ่านแล้วจะเริ่มทันที', 400); }
-            $p = Writer::fresh($id);
-            if (!$p || !Policy::accessible($id, true) || !in_array($p->get_type(), ['simple','variation'], true)) { return API::error('forbidden', 'ชนิดสินค้าไม่รองรับ', 403); }
-            if ($reasons = Policy::fieldReasons($p, 'sale_price')) { return API::error('write_unavailable', implode('; ', $reasons), 503); }
-            $base = self::snapshot($p);
-            $originalEnd=explode('|',$base['sale_dates'])[1];
-            if ($revive && (!self::hasOriginalSale($base) || $originalEnd==='' || (int)$originalEnd>max(time(),$end))) { return API::error('invalid_input','ใช้ตัวเลือกนี้ได้เมื่อมีโปรเดิมที่หมดอายุภายในช่วงโปรชั่วคราว',400); }
-            if ($base !== $in['baseline']) { return API::error('field_conflict', 'ราคาเปลี่ยนแล้ว โหลดข้อมูลและยืนยันใหม่', 409); }
-            if ((int)$in['price'] >= (int)$base['regular_price'] || ($base['sale_price'] !== '' && (int)$base['sale_price'] >= (int)$base['regular_price']) || ($base['sale_price'] === '' && $base['sale_dates'] !== '|') || is_wp_error(Policy::normalizeDates($base['sale_dates']))) { return API::error('price_relation', 'ราคาโปรใหม่และเดิมต้องต่ำกว่าราคาปกติ ตารางเดิมต้องถูกต้อง', 400); }
-            if ((int)$in['price'] >= (int)self::reference($base, max(time(), $start))['price']) { return API::error('price_relation', 'ราคาโปรชั่วคราวต้องต่ำกว่าราคาปกติ', 400); }
-            if ($wpdb->get_var($wpdb->prepare('SELECT id FROM ' . self::table() . " WHERE product_id=%d AND status IN ('pending','active','needs_review') LIMIT 1", $id))) { return API::error('promotion_exists', 'มีโปรที่รอเริ่ม/กำลังใช้/รอตรวจแล้ว ต้องปิดรายการเดิมก่อน', 409); }
-            $now = gmdate('Y-m-d H:i:s');
-            $row = ['id'=>$op,'product_id'=>$id,'actor_id'=>$actor,'payload_hash'=>$hash,'status'=>'pending','starts_at'=>$start,'ends_at'=>$end,'sale_price'=>$in['price'],'original_json'=>wp_json_encode($base),'expected_json'=>wp_json_encode(array_merge($base,['_revive_expired'=>$revive])),'start_operation'=>wp_generate_uuid4(),'end_operation'=>wp_generate_uuid4(),'message'=>'','created_at'=>$now,'updated_at'=>$now];
+            $base = self::validatePlan($id, $in['price'], $start, $end, $in['baseline'], $revive);
+            if (is_wp_error($base)) { return $base; }
             if ($wpdb->query('START TRANSACTION') === false) { throw new \RuntimeException('Transaction failed.'); } $tx = true;
-            $result = ['ok'=>true,'promotion'=>self::publicRow($row),'operation_id'=>$op]; $item = wp_generate_uuid4();
-            foreach ([[self::table(),$row], [Schema::table('operations'),['operation_id'=>$op,'actor_id'=>$actor,'kind'=>'temporary_plan','payload_hash'=>$hash,'status'=>'completed','created_at'=>$now,'updated_at'=>$now]], [Schema::table('operation_items'),['item_id'=>$item,'operation_id'=>$op,'product_id'=>$id,'field'=>'temporary_sale','base_value'=>$base['sale_price'],'base_revision'=>Writer::revision($id,'sale_price'),'target_value'=>$in['price'],'status'=>'succeeded','canonical_result_json'=>wp_json_encode($result),'created_at'=>$now,'updated_at'=>$now]], [Schema::table('events'),['product_id'=>$id,'field'=>'temporary_sale','old_value'=>'','new_value'=>$op,'revision_before'=>0,'revision_after'=>0,'source'=>'temporary_sale_created','user_id'=>$actor,'operation_id'=>$op,'item_id'=>$item,'request_id'=>API::requestId(),'created_at'=>$now]]] as [$table,$data]) { if ($wpdb->insert($table,$data) === false) { throw new \RuntimeException('Plan registration failed.'); } }
+            [$row, $result] = self::insertPlan($id, $op, $hash, $in['price'], $start, $end, $base, $revive);
             if ($wpdb->query('COMMIT') === false) { throw new \RuntimeException('Commit outcome unknown.'); } $tx = false;
             self::schedule($row); return $result;
         } catch (\Throwable $e) { API::log('writer_failure'); return API::error('operation_unknown', 'ตรวจผลคำสั่งก่อนส่งใหม่ ห้ามเปลี่ยนรหัสคำสั่ง', 409, ['operation_id'=>$op]); }
         finally { if ($tx) { $wpdb->query('ROLLBACK'); } self::unlock($locks); }
     }
+    private static function validatePlan(int $id, string $price, int $start, int $end, ?array $baseline, bool $revive): array|\WP_Error {
+        global $wpdb;
+        $p = Writer::fresh($id);
+        if (!$p || !Policy::accessible($id, true) || !in_array($p->get_type(), ['simple','variation'], true)) { return API::error('forbidden', 'ชนิดสินค้าไม่รองรับ', 403); }
+        if ($reasons = Policy::fieldReasons($p, 'sale_price')) { return API::error('write_unavailable', implode('; ', $reasons), 503); }
+        $base = self::snapshot($p);
+        $originalEnd=explode('|',$base['sale_dates'])[1];
+        if ($revive && (!self::hasOriginalSale($base) || $originalEnd==='' || (int)$originalEnd>max(time(),$end))) { return API::error('invalid_input','ใช้ตัวเลือกนี้ได้เมื่อมีโปรเดิมที่หมดอายุภายในช่วงโปรชั่วคราว',400); }
+        if ($baseline !== null && $base !== $baseline) { return API::error('field_conflict', 'ราคาเปลี่ยนแล้ว โหลดข้อมูลและยืนยันใหม่', 409); }
+        if (($base['sale_price'] !== '' && (int)$base['sale_price'] >= (int)$base['regular_price']) || ($base['sale_price'] === '' && $base['sale_dates'] !== '|') || is_wp_error(Policy::normalizeDates($base['sale_dates']))) { return API::error('price_relation', 'ราคาโปรเดิมหรือช่วงเวลาโปรเดิมของสินค้าไม่ถูกต้อง กรุณาตรวจใน WooCommerce', 400); }
+        $reference = (int)self::reference($base,max(time(),$start))['price'];
+        if ((int)$price >= $reference) {
+            return API::error('price_relation','ราคาโปร '.number_format((int)$price).' บาท ต้องต่ำกว่าราคาอ้างอิง '.number_format($reference).' บาท',400,
+                ['field'=>'price','reference_price'=>$reference]);
+        }
+        $existing = $wpdb->get_var($wpdb->prepare('SELECT id FROM ' . self::table() . " WHERE product_id=%d AND status IN ('pending','active','needs_review') LIMIT 1", $id));
+        if ($wpdb->last_error) { return API::error('promotion_read_failed', 'ตรวจโปรเดิมไม่ได้ กรุณาลองอีกครั้ง', 503); }
+        if ($existing) { return API::error('promotion_exists', 'มีโปรที่รอเริ่ม/กำลังใช้/รอตรวจแล้ว ต้องปิดรายการเดิมก่อน', 409); }
+        return $base;
+    }
+    private static function insertPlan(int $id, string $op, string $hash, string $price, int $start, int $end, array $base, bool $revive): array {
+        global $wpdb; $actor = get_current_user_id();
+        $now = gmdate('Y-m-d H:i:s');
+        $row = ['id'=>$op,'product_id'=>$id,'actor_id'=>$actor,'payload_hash'=>$hash,'status'=>'pending','starts_at'=>$start,'ends_at'=>$end,'sale_price'=>$price,'original_json'=>wp_json_encode($base),'expected_json'=>wp_json_encode(array_merge($base,['_revive_expired'=>$revive])),'start_operation'=>wp_generate_uuid4(),'end_operation'=>wp_generate_uuid4(),'message'=>'','created_at'=>$now,'updated_at'=>$now];
+        $result = ['ok'=>true,'promotion'=>self::publicRow($row),'operation_id'=>$op]; $item = wp_generate_uuid4();
+        foreach ([[self::table(),$row], [Schema::table('operations'),['operation_id'=>$op,'actor_id'=>$actor,'kind'=>'temporary_plan','payload_hash'=>$hash,'status'=>'completed','created_at'=>$now,'updated_at'=>$now]], [Schema::table('operation_items'),['item_id'=>$item,'operation_id'=>$op,'product_id'=>$id,'field'=>'temporary_sale','base_value'=>$base['sale_price'],'base_revision'=>Writer::revision($id,'sale_price'),'target_value'=>$price,'status'=>'succeeded','canonical_result_json'=>wp_json_encode($result),'created_at'=>$now,'updated_at'=>$now]], [Schema::table('events'),['product_id'=>$id,'field'=>'temporary_sale','old_value'=>'','new_value'=>$op,'revision_before'=>0,'revision_after'=>0,'source'=>'temporary_sale_created','user_id'=>$actor,'operation_id'=>$op,'item_id'=>$item,'request_id'=>API::requestId(),'created_at'=>$now]]] as [$table,$data]) { if ($wpdb->insert($table,$data) === false) { throw new \RuntimeException('Plan registration failed.'); } }
+        return [$row, $result];
+    }
+    public static function canImport(): bool {
+        return current_user_can('sdd_manage_settings') && current_user_can('sdd_edit_products')
+            && current_user_can('sdd_view_products') && current_user_can('sdd_bulk_edit');
+    }
+
+    private static function nameMatches(string $name): array {
+        global $wpdb;
+        return array_map('intval', $wpdb->get_col($wpdb->prepare(
+            "SELECT ID FROM $wpdb->posts WHERE post_type IN ('product','product_variation')
+             AND post_status='publish' AND BINARY post_title=%s LIMIT 2", $name
+        )));
+    }
+
+    private static function modelPattern(string $name): ?string {
+        if (strlen($name) > 40 || !preg_match('/^[A-Z0-9]+(?:[ -]+[A-Z0-9]+)*$/iD', $name)
+            || !preg_match('/[a-z]/i', $name) || !preg_match('/[0-9]/', $name)) { return null; }
+        $parts = preg_split('/[ -]+|(?<=[a-z])(?=[0-9])|(?<=[0-9])(?=[a-z])/i', strtolower($name));
+        return '(^|[^a-z0-9])'.implode('[[:space:]-]*', $parts).'([^a-z0-9]|$)';
+    }
+
+    private static function modelMatches(string $name): array {
+        if (!$pattern = self::modelPattern($name)) { return []; }
+        global $wpdb;
+        return array_map('intval', $wpdb->get_col($wpdb->prepare(
+            "SELECT ID FROM $wpdb->posts WHERE post_type IN ('product','product_variation')
+             AND post_status='publish' AND LOWER(post_title) REGEXP %s LIMIT 2", $pattern
+        )));
+    }
+
+    private static function importReview(string $batch, array $draft): array {
+        $ready = []; $issues = $draft['errors']; $seen = [];
+        foreach ($draft['rows'] as $row) {
+            if (!empty($draft['removed'][$row['row']])) { continue; }
+            $id = $row['id'] ?? null;
+            if (!$id || isset($row['message']) || isset($seen[$id])) {
+                $issues[] = ['row'=>$row['row'],'name'=>$row['input'],'selectable'=>true,'id'=>$id,
+                    'price'=>$row['price'],'from'=>$row['from'],'until'=>$row['until'],'duplicate_row'=>$seen[$id] ?? null,
+                    'message'=>$row['message'] ?? ('สินค้าเดียวกับแถว '.$seen[$id].' กรุณาเลือกสินค้าอื่นหรือแก้ไฟล์')];
+                continue;
+            }
+            $seen[$id] = $row['row'];
+            $row['regular_price'] = $row['base']['regular_price'] ?? null;
+            $row['clears_schedule'] = !empty($row['permanent']) && ($row['base']['sale_dates'] ?? '|') !== '|';
+            unset($row['base'],$row['revisions']);
+            $ready[] = $row;
+        }
+        foreach ($issues as &$issue) {
+            if (!isset($issue['edit'])) { continue; }
+            $matches = self::nameMatches($issue['name']);
+            if (!$matches) { $matches = self::modelMatches($issue['name']); }
+            $issue['price_context'] = null;
+            if (count($matches) !== 1 || !Policy::accessible($matches[0],true)) { continue; }
+            $product = wc_get_product($matches[0]);
+            if (!$product || !$product->is_type(['simple','variation'])) { continue; }
+            $issue['price_context'] = ['current'=>$product->get_price('edit'),'regular'=>$product->get_regular_price('edit')];
+        }
+        unset($issue);
+        usort($issues, static fn($a,$b) => $a['row'] <=> $b['row']);
+        return ['batch'=>$batch,'revision'=>$draft['revision'],'total'=>$draft['total'],'expires_at'=>(int)$draft['expires'],'server_time'=>time(),
+            'mode'=>$draft['mode'] ?? 'temporary','errors'=>$issues,'rows'=>$ready,'removed'=>array_keys($draft['removed'] ?? []),
+            'removed_items'=>array_values(array_map(static fn($row) => [
+                'row'=>$row['row'],'name'=>$row['name'] ?? $row['input'],'input'=>$row['input'],
+            ],array_filter($draft['rows'],static fn($row) => !empty($draft['removed'][$row['row']]))))];
+    }
+
+    private static function importDraft(string $batch): array|\WP_Error {
+        if (!self::canImport()) { return API::error('forbidden', 'ไม่มีสิทธิ์นำเข้าโปร', 403); }
+        if (!self::uuid($batch) || !Schema::ready()) { return API::error('invalid_batch', 'ไม่พบชุดนำเข้า', 404); }
+        $draft = get_transient('sdd_promo_csv_'.$batch);
+        if (!is_array($draft) || ($draft['actor'] ?? null) !== get_current_user_id()
+            || ($draft['expires'] ?? 0) <= time() || $draft['timezone'] !== wp_timezone_string()) {
+            return API::error('preview_expired', 'ผลตรวจหมดอายุ กรุณาอัปโหลดไฟล์อีกครั้ง', 404);
+        }
+        return $draft;
+    }
+
+    public static function importSearch(string $batch, mixed $query, int $rowNumber = 0): array|\WP_Error {
+        $draft = self::importDraft($batch);
+        if (is_wp_error($draft)) { return $draft; }
+        if (!is_string($query) || mb_strlen(trim($query)) < 2 || mb_strlen($query) > 200) {
+            return API::error('invalid_search', 'พิมพ์ชื่อ รุ่น หรือแบรนด์อย่างน้อย 2 ตัวอักษร', 400);
+        }
+        global $wpdb;
+        $query = trim($query);
+        $words = preg_split('/\s+/u', $query, -1, PREG_SPLIT_NO_EMPTY);
+        $title = "CONCAT(p.post_title,' ',COALESCE(parent.post_title,''))";
+        if (!$words) { return API::error('invalid_search', 'พิมพ์ชื่อ รุ่น หรือแบรนด์', 400); }
+        $checks = []; $suggestions = [];
+        foreach (array_slice($words,0,12) as $word) {
+            $like = '%'.$wpdb->esc_like($word).'%';
+            if (mb_strlen($word) >= 4) {
+                $prefix = mb_substr($word,0,mb_strlen($word)-1);
+                $suggestions[] = $wpdb->prepare("$title LIKE %s", '%'.$wpdb->esc_like($prefix).'%');
+            }
+            $checks[] = $wpdb->prepare("($title LIKE %s OR EXISTS (
+                SELECT 1 FROM $wpdb->term_relationships tr
+                JOIN $wpdb->term_taxonomy tt ON tt.term_taxonomy_id=tr.term_taxonomy_id
+                JOIN $wpdb->terms term ON term.term_id=tt.term_id
+                WHERE tr.object_id IN (p.ID,p.post_parent) AND tt.taxonomy IN ('product_brand','product_tag')
+                AND term.name LIKE %s))", $like, $like);
+        }
+        $match = '('.implode(' AND ', $checks).')';
+        if ($pattern = self::modelPattern($query)) {
+            $match .= $wpdb->prepare(" OR LOWER(p.post_title) REGEXP %s", $pattern);
+        }
+        $suggested = $suggestions ? ' OR ('.implode(' OR ', $suggestions).')' : '';
+        $ids = $wpdb->get_col("SELECT p.ID FROM $wpdb->posts p LEFT JOIN $wpdb->posts parent ON parent.ID=p.post_parent
+            WHERE p.post_status='publish' AND p.post_type IN ('product','product_variation')
+            AND ($match $suggested) ORDER BY ($match) DESC, p.post_title, p.ID LIMIT 101");
+        if ($wpdb->last_error) { return API::error('search_unavailable', 'ค้นหาสินค้าไม่ได้ กรุณาลองอีกครั้ง', 503); }
+        $used = [];
+        foreach ($draft['rows'] as $row) {
+            if ($row['row'] !== $rowNumber && isset($row['id']) && empty($draft['removed'][$row['row']])) {
+                $used[$row['id']] ??= $row['row'];
+            }
+        }
+        $items = [];
+        foreach ($ids as $id) {
+            $id = (int)$id;
+            if (!Policy::accessible($id,true)) { continue; }
+            $product = wc_get_product($id);
+            if (!$product || !$product->is_type(['simple','variation']) || Policy::fieldReasons($product,'sale_price')) { continue; }
+            $items[] = ['id'=>$id,'name'=>$product->get_name(),'price'=>$product->get_price('edit'),
+                'variation'=>$product->is_type('variation') ? wc_get_formatted_variation($product,true,true) : '',
+                'used_row'=>$used[$id] ?? null];
+            if (count($items) >= 12) { break; }
+        }
+        return ['items'=>$items,'limited'=>count($ids) >= 101 || count($items) >= 12];
+    }
+
+    public static function importSelect(string $batch, mixed $input): array|\WP_Error {
+        $draft = self::importDraft($batch);
+        if (is_wp_error($draft)) { return $draft; }
+        if (!is_array($input) || !is_int($input['row'] ?? null)) {
+            return API::error('invalid_selection', 'เลือกรายการใหม่อีกครั้ง', 400);
+        }
+        $action = $input['action'] ?? 'select';
+        $replace = $input['replace_row'] ?? null;
+        if (!in_array($action,['select','remove','restore','edit','update'],true)
+            || ($action === 'select' && (!is_int($input['product_id'] ?? null) || $input['product_id'] < 1
+                || ($replace !== null && (!is_int($replace) || $replace === $input['row']))))) {
+            return API::error('invalid_selection', 'เลือกรายการใหม่อีกครั้ง', 400);
+        }
+        $lock = self::lock('operation:'.$batch);
+        if (!$lock) { return API::error('lock_timeout', 'ชุดนี้กำลังถูกตรวจ กรุณาลองอีกครั้ง', 409); }
+        try {
+            $status = self::importStatus($batch);
+            if (is_wp_error($status)) { return $status; }
+            if ($status['status'] !== 'ready') { return API::error('import_completed','ชุดนี้เริ่มบันทึกแล้ว กรุณาตรวจผล',409); }
+            $draft = self::importDraft($batch);
+            if (is_wp_error($draft)) { return $draft; }
+            if (isset($input['revision']) && $input['revision'] !== $draft['revision']) {
+                return API::error('review_required','รายการเปลี่ยนไป กรุณาตรวจผลล่าสุด',409);
+            }
+            $number = $input['row'];
+            $index = array_search($number,array_column($draft['rows'],'row'),true);
+            if ($action === 'update') {
+                $updated = self::updateImportRow($draft,$number,$input['values'] ?? null);
+                if (is_wp_error($updated)) { return $updated; }
+                $draft = $updated;
+            } elseif ($action === 'edit') {
+                $edited = self::editImportIssue($draft,$number,$input['values'] ?? null);
+                if (is_wp_error($edited)) { return $edited; }
+                $draft = $edited;
+            } elseif ($index === false) {
+                return API::error('invalid_selection','ไม่พบแถวที่เลือก',404);
+            } elseif ($action === 'remove') {
+                $draft['removed'][$number] = true;
+            } elseif ($action === 'restore') {
+                $removal = $draft['removed'][$number] ?? null;
+                if (is_array($removal)) {
+                    $changedIndex = array_search($removal['before']['row'],array_column($draft['rows'],'row'),true);
+                    if ($changedIndex !== false && $draft['rows'][$changedIndex] === $removal['after']) {
+                        $draft['rows'][$changedIndex] = $removal['before'];
+                    }
+                }
+                unset($draft['removed'][$number]);
+            } else {
+                $row = $draft['rows'][$index];
+                if (!empty($draft['removed'][$number])) { return API::error('review_required','คืนแถวนี้ก่อนเลือกสินค้า',409); }
+                if (empty($row['permanent']) && $row['start'] <= time()) { return API::error('preview_changed','เวลาเริ่มผ่านแล้ว กรุณาแก้ไฟล์',409); }
+                $replaced = false;
+                foreach ($draft['rows'] as $other) {
+                    $otherNumber = $other['row'];
+                    if ($otherNumber === $number || !empty($draft['removed'][$otherNumber])
+                        || ($other['id'] ?? null) !== $input['product_id']) { continue; }
+                    if ($otherNumber !== $replace) {
+                        return API::error('duplicate_product','แถว '.$number.' กับแถว '.$otherNumber.' เป็นสินค้าเดียวกัน',409);
+                    }
+                    $replaced = true;
+                }
+                if ($replace !== null && !$replaced) { return API::error('review_required','แถวที่ซ้ำเปลี่ยนไป กรุณาตรวจผลล่าสุด',409); }
+                $selected = self::bindImportRow($row,$input['product_id'],'manual');
+                if (is_wp_error($selected)) { return $selected; }
+                $draft['rows'][$index] = $selected;
+                if ($replaced) { $draft['removed'][$replace] = ['before'=>$row,'after'=>$selected]; }
+            }
+            $draft['revision']++;
+            $remaining = $draft['expires'] - time();
+            if ($remaining <= 0) { return API::error('preview_expired','ผลตรวจหมดอายุ กรุณาอัปโหลดใหม่',404); }
+            if (!set_transient('sdd_promo_csv_'.$batch,$draft,$remaining)) {
+                return API::error('preview_unavailable','ยังบันทึกการเปลี่ยนแปลงไม่ได้ กรุณาลองอีกครั้ง',503);
+            }
+            return self::importReview($batch,$draft);
+        } finally { self::unlock([$lock]); }
+    }
+
+    private static function updateImportRow(array $draft, int $number, mixed $values): array|\WP_Error {
+        $index = array_search($number,array_column($draft['rows'],'row'),true);
+        if ($index === false || !empty($draft['removed'][$number]) || !is_array($values)) {
+            return API::error('invalid_selection','ไม่พบรายการที่แก้ไขได้',400);
+        }
+        $original = $draft['rows'][$index];
+        if (!isset($original['id']) || isset($original['message'])) {
+            return API::error('review_required','เลือกสินค้าให้ครบก่อนแก้ไขราคา',409);
+        }
+        $allowed = !empty($original['permanent']) ? ['price'] : ['price','from','until'];
+        if (array_diff($allowed,array_keys($values)) || array_diff(array_keys($values),$allowed)) {
+            return API::error('invalid_selection','กรอกราคาและวันเวลาให้ครบ',400);
+        }
+        foreach ($values as $value) {
+            if (!is_string($value) || strlen($value)>100 || preg_match('/[\r\n]/',$value)) {
+                return API::error('invalid_selection','กรอกข้อมูลในรูปแบบที่ระบุ',400);
+            }
+        }
+        if ((string)get_post_field('post_title',$original['id'],'raw') !== $original['name']) {
+            return API::error('review_required','ชื่อสินค้าเปลี่ยนไป กรุณาตรวจผลล่าสุด',409);
+        }
+        $fields = [$original['input'],$values['price'],$values['from'] ?? '',$values['until'] ?? ''];
+        $parsed = self::importRow($fields,$number,$original['input'],$draft['mode'] ?? 'temporary',$original['id'],$original['method']);
+        if (is_wp_error($parsed)) { return $parsed; }
+        // The user's chosen product remains authoritative even when the file uses an alias.
+        $updated = self::bindImportRow($parsed,$original['id'],$original['method']);
+        if (is_wp_error($updated)) { return $updated; }
+        $draft['rows'][$index] = $updated;
+        return $draft;
+    }
+
+    private static function importIssue(int $number, array $fields, \WP_Error $error): array {
+        $issue = ['row'=>$number,'name'=>trim((string)$fields[0]),'message'=>$error->get_error_message()];
+        if (in_array($error->get_error_code(),['invalid_price','invalid_dates'],true)) {
+            $issue['edit'] = $error->get_error_data()['field'] ?? 'price';
+            $issue['values'] = array_combine(['price','from','until'],array_map(
+                static fn($value) => mb_substr(trim((string)$value),0,100),array_slice($fields,1)
+            ));
+        }
+        return $issue;
+    }
+
+    private static function editImportIssue(array $draft, int $number, mixed $values): array|\WP_Error {
+        $index = array_search($number,array_column($draft['errors'],'row'),true);
+        if ($index === false || !isset($draft['errors'][$index]['edit']) || !is_array($values)) {
+            return API::error('invalid_selection','ไม่พบแถวราคาและวันที่ที่แก้ได้',400);
+        }
+        $issue = $draft['errors'][$index];
+        $allowed = $issue['edit'] === 'price' ? ['price'] : ['from','until'];
+        if (array_diff($allowed,array_keys($values)) || array_diff(array_keys($values),$allowed)) {
+            return API::error('invalid_selection','กรอกข้อมูลให้ครบก่อนตรวจ',400);
+        }
+        foreach ($values as $value) {
+            if (!is_string($value) || strlen($value) > 100 || preg_match('/[\r\n]/',$value)) {
+                return API::error('invalid_selection','กรอกข้อมูลในรูปแบบที่ระบุ',400);
+            }
+        }
+        $updated = array_replace($issue['values'],$values);
+        $fields = [$issue['name'],$updated['price'],$updated['from'],$updated['until']];
+        $row = self::importRow($fields,$number,$issue['name'],$draft['mode'] ?? 'temporary');
+        if (is_wp_error($row)) {
+            $draft['errors'][$index] = self::importIssue($number,$fields,$row);
+        } else {
+            array_splice($draft['errors'],$index,1);
+            $draft['rows'][] = $row;
+            usort($draft['rows'],static fn($a,$b) => $a['row'] <=> $b['row']);
+        }
+        return $draft;
+    }
+
+    public static function importPreview(\WP_REST_Request $request): array|\WP_Error {
+        if (!self::canImport()) { return API::error('forbidden', 'ไม่มีสิทธิ์นำเข้าโปร', 403); }
+        if (!Schema::ready()) { return API::error('schema_unavailable', 'ระบบตั้งโปรยังไม่พร้อม', 503); }
+        $file = $request->get_file_params()['file'] ?? [];
+        if (($file['error'] ?? null) !== UPLOAD_ERR_OK || !is_string($file['tmp_name'] ?? null)
+            || !is_uploaded_file($file['tmp_name']) || ($file['size'] ?? 0) > 262144) {
+            return API::error('invalid_csv', 'เลือกไฟล์ CSV ขนาดไม่เกิน 256 KB', 400);
+        }
+        $content = file_get_contents($file['tmp_name'], false, null, 0, 262145);
+        if (!is_string($content) || strlen($content) > 262144 || !preg_match('//u', $content) || str_contains($content, "\0")) {
+            return API::error('invalid_csv', 'บันทึกไฟล์เป็น CSV UTF-8 แล้วลองอีกครั้ง', 400);
+        }
+        $mode = $request->get_body_params()['mode'] ?? 'temporary';
+        if (!in_array($mode,['temporary','permanent'],true)) { return API::error('invalid_mode','เลือกประเภทโปรอีกครั้ง',400); }
+        return self::previewCsv($content,$mode);
+    }
+
+    private static function previewCsv(string $content, string $mode = 'temporary'): array|\WP_Error {
+        // One physical line per record. Quoted cells may contain commas or doubled quotes.
+        $cell = '(?:"(?:[^"]|"")*"|[^",]*)';
+        $record = '/^'.$cell.'(?:,'.$cell.')'.($mode === 'permanent' ? '{1}' : '{3}').'$/D';
+        $lines = preg_split('/\r\n|\n|\r/', preg_replace('/^\xEF\xBB\xBF/', '', $content));
+        $header = array_shift($lines);
+        $permanent = $mode === 'permanent';
+        $columns = $permanent ? ['product_name','sale_price'] : ['product_name','sale_price','starts_at','ends_at'];
+        if (str_getcsv($header, ',', '"', '') !== $columns) {
+            return API::error('invalid_header', 'หัวตารางต้องเป็น '.implode(', ',$columns).' ตามลำดับ', 400);
+        }
+        $rows = []; $errors = []; $count = 0;
+        foreach ($lines as $index => $line) {
+            if (trim($line) === '') { continue; }
+            if (++$count > 100) { return API::error('too_many_rows', 'ไฟล์หนึ่งชุดใส่ได้ไม่เกิน 100 รายการ', 400); }
+            $number = $index + 2;
+            if (!preg_match($record, $line)) {
+                $errors[] = ['row'=>$number,'name'=>'','message'=>'แถวนี้ต้องมี '.count($columns).' ช่อง ตรวจจุลภาคและเครื่องหมายคำพูดในไฟล์'];
+                continue;
+            }
+            $fields = array_pad(str_getcsv($line, ',', '"', ''),4,'');
+            $name = trim((string)($fields[0] ?? ''));
+            $row = self::importRow($fields, $number, $name,$mode);
+            if (is_wp_error($row)) {
+                $errors[] = self::importIssue($number,$fields,$row);
+                continue;
+            }
+            $rows[] = $row;
+        }
+        if (!$count) { return API::error('empty_csv', 'เพิ่มสินค้าอย่างน้อย 1 รายการในไฟล์', 400); }
+        $batch = wp_generate_uuid4();
+        $draft = ['actor'=>get_current_user_id(),'timezone'=>wp_timezone_string(),'expires'=>time()+900,
+            'revision'=>1,'mode'=>$mode,'total'=>$count,'rows'=>$rows,'errors'=>$errors];
+        if (!set_transient('sdd_promo_csv_'.$batch,$draft,900)) {
+            return API::error('preview_unavailable','ยังเก็บผลตรวจไม่ได้ กรุณาตรวจไฟล์อีกครั้ง',503);
+        }
+        return self::importReview($batch,$draft);
+    }
+
+    private static function importRow(array $fields, int $number, string $name, string $mode, ?int $chosenId = null, ?string $chosenMethod = null): array|\WP_Error {
+        if (count($fields) !== 4 || $name === '' || strlen($name) > 1024 || preg_match('/[\r\n]/', implode('', $fields))) {
+            return API::error('invalid_row', 'กรอกชื่อสินค้า ราคา วันเริ่ม และวันจบให้ครบในแถวเดียว', 400);
+        }
+        [, $price, $from, $until] = array_map('trim', $fields);
+        if (!Policy::integer($price) || (int)$price < 1) {
+            return API::error('invalid_price', 'ใส่ราคาโปรเป็นจำนวนเต็มบาทที่มากกว่า 0', 400);
+        }
+        $permanent = $mode === 'permanent';
+        $start = $end = 0;
+        if (!$permanent) {
+            $start = preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/D', $from) ? self::parseTime(str_replace(' ', 'T', $from)) : null;
+            $end = preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/D', $until) ? self::parseTime(str_replace(' ', 'T', $until)) : null;
+            if ($start === null || $start <= time()) {
+                return API::error('invalid_dates',$start === null ? 'กรอกวันเริ่มเป็น YYYY-MM-DD HH:mm' : 'เวลาเริ่มผ่านไปแล้ว เลือกเวลาในอนาคต',400,['field'=>'from']);
+            }
+            if ($end === null || $end <= $start) {
+                return API::error('invalid_dates',$end === null ? 'กรอกวันจบเป็น YYYY-MM-DD HH:mm' : 'วันจบต้องอยู่หลังวันเริ่ม',400,['field'=>'until']);
+            }
+        }
+        $row = ['row'=>$number,'permanent'=>$permanent,'input'=>$name,'price'=>$price,'start'=>$start,'end'=>$end,'from'=>$from,'until'=>$until];
+        $matches = $chosenId === null ? self::nameMatches($name) : [$chosenId];
+        $method = $chosenMethod ?? 'exact';
+        if (!$matches) { $matches = self::modelMatches($name); $method = 'model'; }
+        if (count($matches) !== 1) {
+            return $row + ['message'=>$matches ? 'พบหลายรายการ กรุณาเลือกสินค้าที่ต้องการ' : 'ยังไม่พบสินค้า กรุณาค้นหาและเลือกสินค้า'];
+        }
+        $selected = self::bindImportRow($row,$matches[0],$method);
+        if (is_wp_error($selected) && ($selected->get_error_data()['field'] ?? null) === 'price') {
+            return API::error('invalid_price',$selected->get_error_message(),400,['field'=>'price']);
+        }
+        return is_wp_error($selected) ? $row + ['message'=>$selected->get_error_message()] : $selected;
+    }
+
+    private static function bindImportRow(array $row, int $id, string $method): array|\WP_Error {
+        $base = self::validatePlan($id,$row['price'],$row['start'],$row['end'],null,false);
+        if (is_wp_error($base)) { return $base; }
+        $name = (string)get_post_field('post_title',$id,'raw');
+        [$originalStart,$originalEnd] = explode('|', $base['sale_dates']);
+        $end = $row['end'];
+        $originalSaleAtEnd = self::hasOriginalSale($base) && ($originalStart === '' || (int)$originalStart <= $end)
+            && ($originalEnd === '' || (int)$originalEnd >= $end);
+        unset($row['message']);
+        $revisions = [];
+        if (!empty($row['permanent'])) {
+            foreach (array_keys($base) as $field) { $revisions[$field] = Writer::revision($id,$field); }
+        }
+        return array_replace($row,['id'=>$id,'name'=>$name,'method'=>$method,'base'=>$base,'revisions'=>$revisions,
+            'current_price'=>get_post_meta($id,'_price',true), 'before'=>self::reference($base,$row['start'])['price'],'after'=>$originalSaleAtEnd ? $base['sale_price'] : $base['regular_price']]);
+    }
+
+    /** Use the normal audited Writer for each product, with durable IDs for safe retries. */
+    private static function continuePermanent(string $batch, array $manifest): array|\WP_Error {
+        global $wpdb;
+        $table = Schema::table('operations');
+        $started = microtime(true);
+        $handled = 0;
+        foreach ($manifest['rows'] as $index=>$row) {
+            if (isset($manifest['results'][$index])) { continue; }
+            if ($handled >= 5 || microtime(true)-$started >= 6) { break; }
+            $handled++;
+            $saved = Writer::salePlan($row['id'],[
+                'operation_id'=>$row['operation'],'price'=>$row['price'],'dates'=>'|',
+                'baseline'=>$row['base'],'base_revisions'=>$row['revisions'],'confirmed'=>true,
+            ], static function () use ($row) {
+                $valid = self::validatePlan($row['id'],$row['price'],time(),time(),$row['base'],false);
+                return is_wp_error($valid) ? $valid : true;
+            });
+            if (is_wp_error($saved) && in_array($saved->get_error_code(),['operation_unknown','lock_timeout','nested_write'],true)) {
+                return $saved;
+            }
+            $manifest['results'][$index] = ['row'=>$row['row'],'name'=>$row['name'],'ok'=>!is_wp_error($saved),
+                'message'=>is_wp_error($saved) ? $saved->get_error_message() : ''];
+            $status = count($manifest['results']) === count($manifest['rows']) ? 'completed' : 'running';
+            if ($wpdb->update($table,['preview_json'=>wp_json_encode($manifest),'status'=>$status,'updated_at'=>gmdate('Y-m-d H:i:s')],['operation_id'=>$batch]) !== 1) {
+                return API::error('operation_unknown','ตรวจผลชุดเดิมก่อนทำต่อ',409);
+            }
+        }
+        return self::permanentResult($manifest);
+    }
+
+    private static function permanentResult(array $manifest): array {
+        $success = array_filter($manifest['results'],static fn($row) => $row['ok']);
+        $total = count($manifest['rows']);
+        return ['mode'=>'permanent','status'=>count($manifest['results']) === $total ? 'completed' : 'running',
+            'revision'=>$manifest['revision'],'count'=>count($success),'total'=>$total,'processed'=>count($manifest['results']),
+            'errors'=>array_values(array_filter($manifest['results'],static fn($row) => !$row['ok']))];
+    }
+
+    private static function permanentManifest(string $batch): array|\WP_Error|null {
+        global $wpdb;
+        $raw = $wpdb->get_var($wpdb->prepare('SELECT preview_json FROM '.Schema::table('operations').
+            " WHERE operation_id=%s AND actor_id=%d AND kind='permanent_csv'", $batch,get_current_user_id()));
+        if ($wpdb->last_error) { return API::error('status_unavailable','ยังอ่านผลไม่ได้ กรุณาตรวจผลอีกครั้ง',503); }
+        return is_string($raw) ? json_decode($raw,true,512,JSON_THROW_ON_ERROR) : null;
+    }
+
+    public static function importStatus(string $batch): array|\WP_Error {
+        if (!self::canImport()) { return API::error('forbidden', 'ไม่มีสิทธิ์นำเข้าโปร', 403); }
+        if (!self::uuid($batch) || !Schema::ready()) { return API::error('invalid_batch', 'ไม่พบชุดนำเข้า', 404); }
+        $manifest = self::permanentManifest($batch);
+        if (is_wp_error($manifest)) { return $manifest; }
+        if ($manifest !== null) { return self::permanentResult($manifest); }
+        global $wpdb;
+        $result = $wpdb->get_var($wpdb->prepare('SELECT preview_json FROM '.Schema::table('operations').
+            " WHERE operation_id=%s AND actor_id=%d AND kind='temporary_csv' AND status='completed'", $batch, get_current_user_id()));
+        if ($wpdb->last_error) { return API::error('status_unavailable', 'ยังอ่านผลไม่ได้ กรุณาตรวจผลอีกครั้ง', 503); }
+        if (is_string($result)) { return ['status'=>'completed'] + json_decode($result,true); }
+        $draft = self::importDraft($batch);
+        return is_wp_error($draft) ? $draft : ['status'=>'ready'] + self::importReview($batch,$draft);
+    }
+
+    /** Cancel only an uncommitted draft, using the same lock as confirmation. */
+    public static function importCancel(string $batch): array|\WP_Error {
+        if (!self::canImport()) { return API::error('forbidden', 'ไม่มีสิทธิ์นำเข้าโปร', 403); }
+        if (!self::uuid($batch) || !Schema::ready()) { return API::error('invalid_batch', 'ไม่พบชุดนำเข้า', 404); }
+        $lock = self::lock('operation:'.$batch);
+        if (!$lock) { return API::error('lock_timeout','ชุดนี้กำลังดำเนินการ กรุณาตรวจผลก่อนยกเลิก',409); }
+        try {
+            $status = self::importStatus($batch);
+            if (is_wp_error($status)) { return $status; }
+            if ($status['status'] !== 'ready') {
+                return API::error('import_started','ชุดนี้เริ่มบันทึกแล้ว ยกเลิกการนำเข้าจากหน้านี้ไม่ได้ กรุณาตรวจผลคำสั่งเดิม',409);
+            }
+            if (!delete_transient('sdd_promo_csv_'.$batch) && get_transient('sdd_promo_csv_'.$batch) !== false) {
+                return API::error('cancel_unavailable','ยังยกเลิกไม่ได้ กรุณาลองอีกครั้ง',503);
+            }
+            return ['status'=>'cancelled'];
+        } finally { self::unlock([$lock]); }
+    }
+
+    public static function importConfirm(string $batch, mixed $revision = null): array|\WP_Error {
+        if (!self::canImport()) { return API::error('forbidden', 'ไม่มีสิทธิ์นำเข้าโปร', 403); }
+        if (!self::uuid($batch) || !Schema::ready()) { return API::error('invalid_batch', 'ไม่พบชุดนำเข้า', 404); }
+        global $wpdb;
+        $lock = self::lock('operation:'.$batch);
+        if (!$lock) { return API::error('lock_timeout', 'กำลังบันทึกชุดนี้ กรุณาตรวจผลอีกครั้ง', 409); }
+        $locks = [$lock]; $transaction = false; $plans = [];
+        try {
+            $manifest = self::permanentManifest($batch);
+            if (is_wp_error($manifest)) { return $manifest; }
+            if ($manifest !== null) {
+                if ($revision !== $manifest['revision']) { return API::error('review_required','ตรวจผลล่าสุดก่อนทำต่อ',409); }
+                return self::continuePermanent($batch,$manifest);
+            }
+            $status = self::importStatus($batch);
+            if (is_wp_error($status) || $status['status'] === 'completed') { return $status; }
+            $preview = self::importDraft($batch);
+            if (is_wp_error($preview)) { return $preview; }
+            if ($revision !== $preview['revision'] || $status['errors'] || !$status['rows']) {
+                return API::error('review_required','ตรวจผลล่าสุดและแก้รายการที่มีปัญหาก่อนยืนยัน',409);
+            }
+            $activeRows = array_filter($preview['rows'], static fn($row) => empty($preview['removed'][$row['row']]));
+            $ids = [];
+            foreach ($activeRows as $row) {
+                $ids[] = $row['id'];
+                if ($parent = (int)get_post_field('post_parent', $row['id'])) { $ids[] = $parent; }
+            }
+            sort($ids, SORT_NUMERIC);
+            foreach (array_unique($ids) as $id) {
+                $lock = self::lock('product:'.$id);
+                if (!$lock) { return API::error('lock_timeout', 'สินค้ากำลังถูกแก้ไข กรุณาตรวจผลก่อนลองอีกครั้ง', 409); }
+                $locks[] = $lock;
+            }
+            foreach ($activeRows as $row) {
+                $base = self::validatePlan($row['id'],$row['price'],$row['start'],$row['end'],$row['base'],false);
+                $sameProduct = (string)get_post_field('post_title',$row['id'],'raw') === $row['name'];
+                if ($row['method'] === 'exact') { $sameProduct = $sameProduct && self::nameMatches($row['input']) === [$row['id']]; }
+                if ($row['method'] === 'model') {
+                    $sameProduct = $sameProduct && !self::nameMatches($row['input']) && self::modelMatches($row['input']) === [$row['id']];
+                }
+                if ((empty($row['permanent']) && $row['start'] <= time()) || !$sameProduct || is_wp_error($base)) {
+                    return API::error('preview_changed', 'แถว '.$row['row'].' · '.$row['name'].' · '.(is_wp_error($base) ? $base->get_error_message() : 'ชื่อสินค้าหรือเวลาเริ่มเปลี่ยนไป').' กรุณาตรวจไฟล์อีกครั้ง', 409);
+                }
+            }
+            if (($preview['mode'] ?? 'temporary') === 'permanent') {
+                $rows = array_values($activeRows);
+                foreach ($rows as &$row) { $row['operation'] = wp_generate_uuid4(); }
+                unset($row);
+                $manifest = ['revision'=>$preview['revision'],'rows'=>$rows,'results'=>[]];
+                $now = gmdate('Y-m-d H:i:s');
+                if ($wpdb->insert(Schema::table('operations'),['operation_id'=>$batch,'actor_id'=>get_current_user_id(),
+                    'kind'=>'permanent_csv','payload_hash'=>hash('sha256',wp_json_encode($preview)),
+                    'preview_json'=>wp_json_encode($manifest),'status'=>'running','created_at'=>$now,'updated_at'=>$now]) !== 1) {
+                    return API::error('operation_unknown','ตรวจผลชุดเดิมก่อนทำต่อ',409);
+                }
+                // The shared Writer owns each product lock. Keep only the batch lock.
+                self::unlock(array_slice($locks,1));
+                $locks = [$lock];
+                return self::continuePermanent($batch,$manifest);
+            }
+            if ($wpdb->query('START TRANSACTION') === false) { throw new \RuntimeException('Transaction failed.'); }
+            $transaction = true;
+            foreach ($activeRows as $row) {
+                $op = wp_generate_uuid4();
+                $hash = hash('sha256', wp_json_encode([get_current_user_id(),$row['id'],$row['price'],$row['start'],$row['end'],$row['base']]));
+                [$plans[]] = self::insertPlan($row['id'],$op,$hash,$row['price'],$row['start'],$row['end'],$row['base'],false);
+            }
+            $result = ['count'=>count($plans),'first_start'=>min(array_column($plans,'starts_at'))];
+            if ($result['first_start'] <= time()) {
+                return API::error('preview_changed', 'ถึงเวลาเริ่มของบางรายการแล้ว กรุณาแก้เวลาและตรวจไฟล์อีกครั้ง', 409);
+            }
+            $now = gmdate('Y-m-d H:i:s');
+            if ($wpdb->insert(Schema::table('operations'), ['operation_id'=>$batch,'actor_id'=>get_current_user_id(),
+                'kind'=>'temporary_csv','payload_hash'=>hash('sha256',wp_json_encode($preview)), 'preview_json'=>wp_json_encode($result),
+                'status'=>'completed','created_at'=>$now,'updated_at'=>$now]) !== 1 || $wpdb->query('COMMIT') === false) {
+                throw new \RuntimeException('Batch commit failed.');
+            }
+            $transaction = false;
+        } catch (\Throwable) {
+            API::log('writer_failure');
+            return API::error('operation_unknown', 'กรุณาตรวจผลการตั้งโปรก่อนส่งใหม่', 409);
+        } finally {
+            if ($transaction) { $wpdb->query('ROLLBACK'); }
+            self::unlock($locks);
+        }
+        delete_transient('sdd_promo_csv_'.$batch);
+        try {
+            foreach ($plans as $plan) { self::schedule($plan); }
+        } catch (\Throwable) { API::log('writer_failure'); }
+
+        return ['status'=>'completed'] + $result;
+    }
+
     private static function schedule(array $r): void {
         if (!in_array($r['status'], ['pending','active'], true)) { return; }
         self::scheduleScan();

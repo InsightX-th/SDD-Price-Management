@@ -40,7 +40,7 @@ final class Writer {
     public static function transition(int $id, array $input, array $bundle): array|\WP_Error {
         return self::run($id, $input, $bundle);
     }
-    public static function salePlan(int $id, mixed $in): array|\WP_Error {
+    public static function salePlan(int $id, mixed $in, ?callable $guard = null): array|\WP_Error {
         if (!is_array($in) || array_diff(array_keys($in), ['operation_id','price','dates','baseline','base_revisions','confirmed','zero_ack']) || !is_string($in['operation_id'] ?? null) || !Policy::integer($in['price'] ?? null, true) || !is_string($in['dates'] ?? null) || strlen($in['dates']) > 64 || ($in['confirmed'] ?? false) !== true || !is_array($in['baseline'] ?? null) || !is_array($in['base_revisions'] ?? null)) { return API::error('invalid_input', 'ข้อมูลแผนโปรไม่ครบหรือยังไม่ยืนยัน', 400); }
         $fields = ['regular_price','sale_price','sale_dates'];
         if (array_keys($in['baseline']) !== $fields || array_keys($in['base_revisions']) !== $fields) { return API::error('invalid_input','รูปแบบ baseline ไม่ถูกต้อง',400); }
@@ -48,7 +48,7 @@ final class Writer {
         if ($in['price'] === '0' && ($in['zero_ack'] ?? false) !== true) { return API::error('confirmation_required','ยืนยันราคาศูนย์ก่อนบันทึก',400); }
         $dates=Policy::normalizeDates($in['dates']); if (is_wp_error($dates)) { return $dates; }
         if ($dates !== '|' && $in['price'] === '') { return API::error('price_relation','กำหนดราคาโปรก่อนตั้งเวลา',400); }
-        return self::run($id, ['operation_id'=>$in['operation_id'],'field'=>'sale_price','value'=>$in['price'],'base_value'=>$in['baseline']['sale_price'],'base_revision'=>$in['base_revisions']['sale_price'],'acknowledgements'=>['price_change','zero_price','expired_schedule']], ['expected'=>$in['baseline'],'revisions'=>$in['base_revisions'],'target'=>['sale_price'=>$in['price'],'sale_dates'=>$dates],'promotion'=>'native_sale_plan','source'=>'native_sale_plan','kind'=>'native_sale_plan','guard'=>static fn()=>true,'record'=>static function(array $values):void{}]);
+        return self::run($id, ['operation_id'=>$in['operation_id'],'field'=>'sale_price','value'=>$in['price'],'base_value'=>$in['baseline']['sale_price'],'base_revision'=>$in['base_revisions']['sale_price'],'acknowledgements'=>['price_change','zero_price','expired_schedule']], ['expected'=>$in['baseline'],'revisions'=>$in['base_revisions'],'target'=>['sale_price'=>$in['price'],'sale_dates'=>$dates],'promotion'=>'native_sale_plan','source'=>'native_sale_plan','kind'=>'native_sale_plan','guard'=>$guard ?? static fn()=>true,'record'=>static function(array $values):void{}]);
     }
     private static function run(int $id, array $input, ?array $bundle): array|\WP_Error {
         global $wpdb;
