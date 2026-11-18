@@ -1,0 +1,10 @@
+.DS_Store
+/.archify/
+/outputs/
+/docs/reviews/
+/docs/screenshots/development/
+/docs/cloudflare-auto-purge-plan.md
+/.env
+/.env.*
+!/.env.example
+/*.zip

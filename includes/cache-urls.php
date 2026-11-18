@@ -42,11 +42,15 @@ final class CacheURLs {
         $pages = max(1,(int)(wp_count_posts('product')->publish ?? 0)); // Safe upper bound for legacy query-based archives.
         $shop = wc_get_page_permalink('shop');
         if ($shop && wc_get_page_id('shop') > 0) { $entries[$shop] = ['url'=>$shop,'pages'=>$pages]; }
-        foreach (['product_cat','product_tag'] as $taxonomy) {
+        $taxonomies = ['product_cat', 'product_tag'];
+        if (taxonomy_exists('product_brand')) { $taxonomies[] = 'product_brand'; }
+        foreach ($taxonomies as $taxonomy) {
             $terms = wp_get_object_terms($parent, $taxonomy, ['fields'=>'ids']);
             if (is_wp_error($terms)) { throw new \RuntimeException('cache_mapping'); }
             $ids = $terms;
-            if ($taxonomy === 'product_cat') { foreach ($terms as $term) { $ids = array_merge($ids,get_ancestors((int)$term,$taxonomy,'taxonomy')); } }
+            if (is_taxonomy_hierarchical($taxonomy)) {
+                foreach ($terms as $term) { $ids = array_merge($ids, get_ancestors((int)$term, $taxonomy, 'taxonomy')); }
+            }
             foreach (array_unique($ids) as $id) {
                 $url = get_term_link((int)$id,$taxonomy);
                 if (is_wp_error($url)) { throw new \RuntimeException('cache_mapping'); }

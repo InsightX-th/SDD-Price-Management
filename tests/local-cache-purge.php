@@ -9,7 +9,7 @@ if (!defined('SDD_CF_API_TOKEN')) { define('SDD_CF_API_TOKEN','fixture-not-a-rea
 if (!defined('SDD_CF_LIVE_VERIFIED')) { define('SDD_CF_LIVE_VERIFIED',true); }
 $failures=[];$checks=0;
 $check=static function(bool $ok,string $label)use(&$failures,&$checks):void{$checks++;echo ($ok?'PASS ':'FAIL ').$label."\n";if(!$ok)$failures[]=$label;};
-$original=[];foreach(['sdd_settings','sdd_cache_settings','sdd_cf_connection','sdd_cache_settings_audit','sdd_cache_worker_at','sdd_cache_throttle_until','woocommerce_shop_page_id','woocommerce_cart_page_id'] as $key){$original[$key]=get_option($key,null);}
+$original=[];foreach(['sdd_settings','sdd_cache_settings','sdd_cf_connection','sdd_cf_verification_failure','sdd_cache_settings_audit','sdd_cache_worker_at','sdd_cache_throttle_until','sdd_cache_pause_reason','woocommerce_shop_page_id','woocommerce_cart_page_id'] as $key){$original[$key]=get_option($key,null);}
 $products=[];$posts=[];$opids=[];$start=null;
 $home=static fn($url)=>preg_replace('#^https?://[^/]+#','https://sdd-cache.test',$url);add_filter('home_url',$home);
 $httpCalls=[];$httpMode='success';$duringHTTP=null;
@@ -30,7 +30,8 @@ try{
  $check(CacheSchema::migrate()&&CacheSchema::ready(),'optional schema migrates with InnoDB and unique indexes');
  if(!CacheSchema::ready())throw new RuntimeException('Cache schema unavailable');
  $start=(int)$wpdb->get_var('SELECT COALESCE(MAX(id),0) FROM '.CacheSchema::table('outbox'));
- if((int)$wpdb->get_var("SELECT COUNT(*) FROM ".CacheSchema::table('outbox')." WHERE status NOT IN ('accepted','simulated')"))throw new RuntimeException('Resolve unrelated local cache jobs before running fixtures');
+ if((int)$wpdb->get_var("SELECT COUNT(*) FROM ".CacheSchema::table('outbox')." WHERE status NOT IN ('accepted','simulated','closed')"))throw new RuntimeException('Resolve unrelated local cache jobs before running fixtures');
+ delete_option('sdd_cf_connection');delete_option('sdd_cf_verification_failure');delete_option('sdd_cache_pause_reason');
  update_option('sdd_settings',array_replace(Policy::settings(),['confirmation_mode'=>'always','write_stop'=>false,'local_ack'=>true]),false);
  $shop=wp_insert_post(['post_type'=>'page','post_status'=>'publish','post_title'=>'Cache fixture shop','post_name'=>'cache-fixture-shop']);$posts[]=$shop;update_option('woocommerce_shop_page_id',$shop);
  $cart=wp_insert_post(['post_type'=>'page','post_status'=>'publish','post_title'=>'Cache fixture cart','post_name'=>'cache-fixture-cart']);$posts[]=$cart;update_option('woocommerce_cart_page_id',$cart);
@@ -60,6 +61,9 @@ try{
  // Reproduce commit-to-scheduler crash gap by saving while dispatch is disabled.
  $settings['dry_run']=false;$settings['dispatch_enabled']=false;update_option('sdd_cache_settings',$settings,false);[$live]=$write($pid,'10300');$liveId=$latest($pid);
  $check(!is_wp_error($live)&&$job($liveId)['mode']==='live'&&$job($liveId)['status']==='pending','committed live job survives with dispatch paused');
+ $switch=CachePurge::saveSettings(array_replace($settings,['dry_run'=>true]));
+ $check(is_wp_error($switch)&&$switch->get_error_code()==='mode_change_pending'&&CachePurge::zoneChangeBlocked(str_repeat('b',32)),'live work blocks a mode or zone change while preserving same-zone credential rotation');
+ $check(CachePurge::statuses([$pid])[(string)$pid]['state']==='paused'&&CachePurge::summary()['operational_state']==='paused','paused queue does not report automatic retry for waiting products');
  $settings['dispatch_enabled']=true;update_option('sdd_cache_settings',$settings,false);$beforeHTTP=count($httpCalls);$row=$run($liveId);
  $check($row['status']==='accepted'&&count($httpCalls)>$beforeHTTP,'recovery dispatches committed work without an admin request');
  $check(Writer::fresh($pid)->get_regular_price('edit')==='10300','purge worker never rewrites product price');
@@ -71,6 +75,7 @@ try{
  $target=$wpdb->get_row($wpdb->prepare('SELECT * FROM '.CacheSchema::table('targets')." WHERE outbox_id=%d AND status='retry_wait' ORDER BY id LIMIT 1",$retryId),ARRAY_A);
  $check($row['status']==='retry_wait'&&(int)$target['next_attempt_at']>=$retryStarted+120,'429 respects Retry-After and retains the job');
  $check((int)get_option('sdd_cache_throttle_until')>=$retryStarted+120,'429 throttles the site dispatcher');
+ $check(strtotime(CachePurge::summary()['next_retry_at']??'')>=$retryStarted+120&&CachePurge::statuses([$pid])[(string)$pid]['state']==='retry_wait','retry status and time are based on the queued retry');
  $check(!str_contains(wp_json_encode(CachePurge::health()),'fixture-secret-must-not-leak')&&!str_contains(wp_json_encode(CachePurge::health()),'fixture-not-a-real-token'),'REST health does not leak token or provider response body');
  $httpMode='success';update_option('sdd_cache_throttle_until',0,false);$retry=CachePurge::retry($retryId);$row=$run($retryId);
  $check(!is_wp_error($retry)&&$row['status']==='accepted'&&(int)$row['last_retry_actor']===(int)$admin[0]&&Writer::fresh($pid)->get_regular_price('edit')==='10400','manual replay retries purge only and preserves price');
@@ -83,7 +88,41 @@ try{
  $httpMode='403';[$r]=$write($pid,'10700');$authId=$latest($pid);$row=$run($authId);
  $check($row['status']==='needs_attention'&&!CachePurge::settings()['dispatch_enabled'],'403 pauses dispatcher and exposes an actionable state');
  $check(Writer::fresh($pid)->get_regular_price('edit')==='10700','authorization failure does not roll back a committed price');
- $httpMode='success';$settings['dispatch_enabled']=true;update_option('sdd_cache_settings',$settings,false);CachePurge::retry($authId);$run($authId);
+ $queue=CachePurge::summary();
+ $health=CachePurge::health(1,'attention');
+ $check($queue['operational_state']==='paused_error'&&$queue['pause_reason']==='cloudflare_403'&&!CachePurge::liveVerified(),'credential failure is distinguished from a manual pause and requires recheck');
+ $check((int)($health['jobs'][0]['id']??0)===$authId&&($health['jobs'][0]['product_name']??'')==='SDD cache purge fixture'&&($health['jobs'][0]['current_price']??'')==='10700','attention filter returns the affected product and current WooCommerce price');
+ $paused=CachePurge::saveSettings(array_replace($settings,['dispatch_enabled'=>false]));
+ $retry=CachePurge::retry($authId);
+ $check(!is_wp_error($paused)&&$paused['settings']['capture_enabled']&&!is_wp_error($retry)&&!$retry['dispatch_enabled']&&$retry['queued'],'retry during an authorization pause queues only and capture stays on');
+ $httpMode='success';$rechecked=CloudflareClient::connect(['zone_id'=>str_repeat('a',32),'api_token'=>'fixture-rechecked-cache-token']);
+ $check(!is_wp_error($rechecked)&&!is_wp_error(CachePurge::saveSettings($settings))&&$run($authId)['status']==='accepted','rechecking Cloudflare and resuming sends the already queued retry');
+
+ // A legacy settled failure with unfinished targets must resume the rest of the job.
+ [$r]=$write($pid,'10750');$partialId=$latest($pid);
+ $outbox=CacheSchema::table('outbox');$targets=CacheSchema::table('targets');
+ $wpdb->update($outbox,['enumerated'=>1,'status'=>'needs_attention','error_code'=>'cloudflare_400'],['id'=>$partialId]);
+ foreach (['failed','pending'] as $part) {
+  $payload=wp_json_encode(['url'=>'https://sdd-cache.test/cache-fixture-'.$part.'/']);
+  $wpdb->insert($targets,['outbox_id'=>$partialId,'target_hash'=>hash('sha256',$payload),'payload_json'=>$payload,'status'=>$part==='failed'?'needs_attention':'pending','next_attempt_at'=>time(),'error_code'=>$part==='failed'?'cloudflare_400':'']);
+ }
+ CachePurge::recover();
+ $check($job($partialId)['status']==='processing','recovery moves previously stranded targets back into the dispatcher');
+ $run($partialId);
+ $acceptedPart=$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $targets WHERE outbox_id=%d AND status='accepted'",$partialId));
+ $check((int)$acceptedPart===1&&$job($partialId)['status']==='needs_attention'&&CachePurge::settings()['dispatch_enabled'],'unfinished targets proceed and failed targets remain actionable without globally pausing');
+ CachePurge::retry($partialId);$run($partialId);
+ [$r]=$write($pid,'10775');$closeId=$latest($pid);
+ $wpdb->update($outbox,['status'=>'needs_attention','error_code'=>'configuration_changed'],['id'=>$closeId]);
+ $beforeClose=count($httpCalls);
+ $closed=CachePurge::close($closeId);
+ $check(!is_wp_error($closed)&&$job($closeId)['status']==='closed'&&CachePurge::statuses([$pid])[(string)$pid]['pending']===0&&!CachePurge::zoneChangeBlocked(str_repeat('b',32))&&count($httpCalls)===$beforeClose&&Writer::fresh($pid)->get_regular_price('edit')==='10775','administrator can close a blocked job without touching the price or making an HTTP request');
+ [$r]=$write($pid,'10790');$pausedCloseId=$latest($pid);
+ $wpdb->update($outbox,['enumerated'=>1,'status'=>'processing'],['id'=>$pausedCloseId]);
+ $check(is_wp_error(CachePurge::close($pausedCloseId))&&CachePurge::zoneChangeBlocked(str_repeat('b',32)),'active dispatch prevents closing a processing job');
+ $paused=CachePurge::saveSettings(array_replace($settings,['dispatch_enabled'=>false]));
+ $check(!is_wp_error($paused)&&!is_wp_error(CachePurge::close($pausedCloseId))&&!CachePurge::zoneChangeBlocked(str_repeat('b',32)),'pausing dispatch allows the administrator to close stranded active work and unblocks Zone change');
+ if (is_wp_error(CachePurge::saveSettings($settings))) { throw new RuntimeException('Cannot resume fixture queue'); }
  // Lease recovery after HTTP completion before acknowledgement.
  [$r]=$write($pid,'10800');$crashId=$latest($pid);
  $interrupt=static function($sql){if(str_starts_with($sql,'UPDATE `'.CacheSchema::table('targets').'`')&&str_contains($sql,"'accepted'"))return 'INVALID ACK FIXTURE SQL';return $sql;};
