@@ -13,15 +13,21 @@ final class SystemLogs {
 
     public static function boot(): void {
         add_action('sdd_log_retention', [self::class, 'prune']);
+        add_action('init', [self::class, 'upgradeLogCapabilities']);
         add_action('init', static function(): void { if (!wp_next_scheduled('sdd_log_retention')) { wp_schedule_event(time()+300, 'daily', 'sdd_log_retention'); } });
-        add_action('admin_init', static function(): void {
-            if (current_user_can('manage_options') && get_option('sdd_p5_log_caps') !== '1') {
-                $role = get_role('administrator');
-                if ($role) { $role->add_cap('sdd_view_system_logs'); update_option('sdd_p5_log_caps', '1', false); wp_get_current_user()->get_role_caps(); }
-            }
-            if (current_user_can('manage_options') && !wp_next_scheduled('sdd_log_retention')) { wp_schedule_event(time()+300, 'daily', 'sdd_log_retention'); }
-        });
         add_filter('woocommerce_logger_delete_expired_file', [self::class, 'protectRecentFiles'], 10, 3);
+    }
+
+    public static function upgradeLogCapabilities(): void {
+        if (get_option('sdd_p5_log_caps') === '2') { return; }
+        $administrator = get_role('administrator');
+        $shopManager = get_role('shop_manager');
+        if (!$administrator || !$shopManager) { return; }
+        foreach ([$administrator, $shopManager] as $role) {
+            if (!$role->has_cap('sdd_view_system_logs')) { $role->add_cap('sdd_view_system_logs'); }
+        }
+        update_option('sdd_p5_log_caps', '2', false);
+        wp_get_current_user()->get_role_caps();
     }
 
     private static function controller(): mixed {
