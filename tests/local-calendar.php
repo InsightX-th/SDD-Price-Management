@@ -12,6 +12,17 @@ try{
  if($wpdb->insert(Schema::table('temporary_sales'),$row)===false)throw new RuntimeException($wpdb->last_error);
  $month=wp_date('Y-m',$now,wp_timezone());$result=Dashboard::calendar(['month'=>$month]);$alert=Dashboard::alerts([]);
  $check(!is_wp_error($result)&&count(array_filter($result['items'],fn($i)=>$i['promotion_id']===$uuid&&$i['status']==='needs_review'&&$i['price']==='12345'))===1,'calendar shows accessible review promotion with price');
+ for($i=0;$i<200;$i++){
+  $filler=array_replace($row,['id'=>wp_generate_uuid4(),'status'=>'cancelled','starts_at'=>$now-601,'start_operation'=>wp_generate_uuid4(),'end_operation'=>wp_generate_uuid4()]);
+  if($wpdb->insert(Schema::table('temporary_sales'),$filler)!==1)throw new RuntimeException('Calendar fixture insert failed');
+ }
+ $second=Dashboard::calendar(['month'=>$month,'page'=>'2']);
+ $filtered=Dashboard::calendar(['month'=>$month,'status'=>'needs_review','search'=>(string)$pid]);
+ $day=wp_date('Y-m-d',$now,wp_timezone());
+ $daily=Dashboard::calendar(['month'=>$month,'day'=>$day,'status'=>'needs_review']);
+ $check(!is_wp_error($second)&&in_array($uuid,array_column($second['items'],'promotion_id'),true),'calendar can reach entries after the first 200');
+ $check(!is_wp_error($filtered)&&in_array($uuid,array_column($filtered['items'],'promotion_id'),true),'calendar filters status and search before applying the page limit');
+ $check(!is_wp_error($daily)&&in_array($uuid,array_column($daily['items'],'promotion_id'),true),'daily scope queries the server before applying the month page limit');
  $check(!is_wp_error($alert)&&$alert['state']==='attention','review promotion raises alert');
  $wrong=Dashboard::calendar(['month'=>'2026-13']);$check(is_wp_error($wrong)&&$wrong->get_error_code()==='invalid_query','invalid month rejected');
  wp_set_current_user(0);$a=Dashboard::alerts([]);$c=Dashboard::calendar(['month'=>$month]);$check(is_wp_error($a)&&$a->get_error_code()==='forbidden'&&is_wp_error($c)&&$c->get_error_code()==='forbidden','calendar and alerts require permission');

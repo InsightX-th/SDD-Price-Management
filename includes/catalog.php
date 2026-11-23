@@ -18,7 +18,7 @@ final class Catalog {
         $termIds = self::promotionCategoryIds();
         if (!$termIds) { return '1=0'; }
         $safeIds = implode(',',$termIds);
-        return "p.post_type='post' AND p.post_status='publish' AND EXISTS (SELECT 1 FROM $wpdb->term_relationships tr JOIN $wpdb->term_taxonomy tt ON tt.term_taxonomy_id=tr.term_taxonomy_id WHERE tr.object_id=p.ID AND tt.taxonomy='category' AND tt.term_id IN ($safeIds))";
+        return "p.post_type='post' AND p.post_status='publish' AND p.post_password='' AND EXISTS (SELECT 1 FROM $wpdb->term_relationships tr JOIN $wpdb->term_taxonomy tt ON tt.term_taxonomy_id=tr.term_taxonomy_id WHERE tr.object_id=p.ID AND tt.taxonomy='category' AND tt.term_id IN ($safeIds))";
     }
     /** Published articles in the promotion archive, newest first, for the article picker. */
     public static function promotionArticles(): array {
@@ -126,7 +126,9 @@ final class Catalog {
         }
         if($status===''){return '1=1';}
         $table=Schema::table('temporary_sales');$temp="EXISTS (SELECT 1 FROM $table tp WHERE tp.product_id=$a.ID AND tp.status IN ('pending','active','needs_review'))";
-        $sale="CAST(COALESCE(NULLIF(".self::meta($a,'_sale_price').",''),'0') AS DECIMAL(30,8))";
+        $saleMeta=self::meta($a,'_sale_price');
+        $hasSale="COALESCE($saleMeta,'')<>''";
+        $sale="CAST(NULLIF($saleMeta,'') AS DECIMAL(30,8))";
         $native=self::nativeState($a,$q['now']);
         $canSeeTemporary=current_user_can('sdd_manage_settings');
         if(in_array($status,['temporary_expiring','temporary_upcoming'],true)){
@@ -135,16 +137,16 @@ final class Catalog {
             $condition=$status==='temporary_upcoming'?"tp.status='pending' AND tp.starts_at>$now":"tp.status='active' AND tp.starts_at<=$now AND tp.ends_at>=$now AND tp.ends_at<=$deadline";
             return "EXISTS (SELECT 1 FROM $table tp WHERE tp.product_id=$a.ID AND $condition)";
         }
-        if($status==='current'){
+        if($status==='temporary_current'){
             $now=$q['now'];
             return $canSeeTemporary?"EXISTS (SELECT 1 FROM $table tp WHERE tp.product_id=$a.ID AND tp.status='active' AND tp.starts_at<=$now AND tp.ends_at>=$now)":'1=0';
         }
-        if($status==='expiring'){
+        if(in_array($status,['current','expiring'],true)){
             $now=$q['now'];$deadline=$now+DAY_IN_SECONDS;
             $regular=self::price($a);
             $to="CAST(COALESCE(NULLIF(".self::meta($a,'_sale_price_dates_to').",''),'0') AS SIGNED)";
             $ending=$status==='expiring'?" AND $to>=$now AND $to<=$deadline":'';
-            $nativeCurrent="$sale>0 AND $sale<$regular AND $native IN ('none','active')$ending";
+            $nativeCurrent="$hasSale AND $sale>=0 AND $sale<$regular AND $native IN ('none','active')$ending";
             // Unresolved temporary plans own the price lifecycle; do not infer their state from native dates.
             if(!$canSeeTemporary){return "($nativeCurrent)";}
             $tempEnding=$status==='expiring'?" AND tp.ends_at>=$now AND tp.ends_at<=$deadline":'';
@@ -153,7 +155,7 @@ final class Catalog {
         if($status==='future'){
             $temporary=$canSeeTemporary?"EXISTS (SELECT 1 FROM $table tp WHERE tp.product_id=$a.ID AND tp.status='pending' AND tp.starts_at>{$q['now']}) OR ":'';
             $withoutUnresolved=$canSeeTemporary?"NOT ($temp) AND ":'';
-            return "($temporary($withoutUnresolved $native='future' AND $sale>0 AND $sale<".self::price($a)."))";
+            return "($temporary($withoutUnresolved $native='future' AND $hasSale AND $sale>=0 AND $sale<".self::price($a)."))";
         }
         if($status==='review'){
             $temporary=$canSeeTemporary?" OR EXISTS (SELECT 1 FROM $table tp WHERE tp.product_id=$a.ID AND tp.status='needs_review')":'';
@@ -162,7 +164,7 @@ final class Catalog {
         if($canSeeTemporary){$visible="NOT ($temp) AND ";}else{$visible='';}
         if(str_starts_with($status,'temporary_')){return $wpdb->prepare("EXISTS (SELECT 1 FROM $table tp WHERE tp.product_id=$a.ID AND tp.status=%s)",substr($status,10));}
         if(in_array($status,['none','unscheduled'],true)){
-            return "($visible $native='none' AND $sale".($status==='none'?'<=0':'>0').')';
+            return "($visible $native='none' AND ".($status==='none'?"NOT ($hasSale)":"($hasSale AND $sale>=0)").')';
         }
         return $wpdb->prepare("($visible $native=%s)",$status);
     }
@@ -196,7 +198,7 @@ final class Catalog {
         if(($scope!=='all'||$promotion!=='')&&!Schema::ready()){return API::error('schema_unavailable','Schema ไม่พร้อมสำหรับประวัติหรือตัวกรองโปร',503);}
         if($scope==='recent'){$orderby='recent';$order='desc';}
         $source_ids=$source==='new_promotion'?self::promotionPageProducts($post===''?0:(int)$post):['parents'=>[],'variations'=>[]];
-        $tabPromotion=['current'=>'current','expiring'=>'temporary_expiring','upcoming'=>'temporary_upcoming'][$scope]??'';
+        $tabPromotion=['current'=>'temporary_current','expiring'=>'temporary_expiring','upcoming'=>'temporary_upcoming'][$scope]??'';
         if($tabPromotion!==''){$promotion=$tabPromotion;}
         return compact('tabPromotion','search','page','size','order','orderby','status','scope','promotion','source','source_ids','now');
     }
@@ -252,7 +254,12 @@ final class Catalog {
             $safe = implode(',',array_map('intval',$ids));
             if(($q['scope']??'all')==='recent'){foreach($wpdb->get_results('SELECT p.ID,e.created_at FROM '.$wpdb->posts.' p JOIN '.Schema::table('events').' e ON e.id='."(CASE WHEN p.post_type='product_variation' THEN ".self::recentId('p').' ELSE '.self::recentId('p',true,$q).' END)'." WHERE p.ID IN ($safe)",ARRAY_A) as $event){$recentMap[$event['ID']]=str_replace(' ','T',$event['created_at']).'Z';}}
             if (current_user_can('sdd_manage_settings')) {
-                foreach ($wpdb->get_results('SELECT product_id,status,message,starts_at,ends_at,sale_price FROM '.Schema::table('temporary_sales')." WHERE product_id IN ($safe) AND status IN ('pending','active','needs_review')",ARRAY_A) as $promo) { $promotionMap[$promo['product_id']]=['status'=>$promo['status'],'message'=>$promo['message'],'starts_at'=>(int)$promo['starts_at'],'ends_at'=>(int)$promo['ends_at'],'price'=>(string)$promo['sale_price']]; }
+                $managePrices=TemporarySales::canImport();
+                $columns='product_id,status,message,starts_at,ends_at,sale_price'.($managePrices?',id,original_json,expected_json':'');
+                foreach ($wpdb->get_results("SELECT $columns FROM ".Schema::table('temporary_sales')." WHERE product_id IN ($safe) AND status IN ('pending','active','needs_review')",ARRAY_A) as $promo) {
+                    $promotionMap[$promo['product_id']]=$managePrices?TemporarySales::priceEditSummary($promo):
+                        ['status'=>$promo['status'],'message'=>$promo['message'],'starts_at'=>(int)$promo['starts_at'],'ends_at'=>(int)$promo['ends_at'],'price'=>(string)$promo['sale_price']];
+                }
             }
             foreach ($wpdb->get_results('SELECT product_id,field,revision FROM '.Schema::table('field_state')." WHERE product_id IN ($safe)",ARRAY_A) as $s) { $revisionMap[$s['product_id']][$s['field']]=$s['revision']; }
         }
@@ -260,17 +267,50 @@ final class Catalog {
             if (!Policy::accessible((int)$id)) { continue; }
             $p=wc_get_product((int)$id); if (!$p) { continue; } $parent=$p->is_type('variation')?$p->get_parent_id():0; $taxId=$parent?:$p->get_id();
             $editable=[];$fieldReasons=[];$revisions=[];$reasons=[];
+            $bundlePricing=Policy::supportsBundlePromotion($p);
             foreach (Policy::FIELDS as $field) {
-                $fieldReasons[$field]=array_values(array_unique(array_merge(Policy::fieldReasons($p,$field),$access['reasons'])));
+                $fieldReasons[$field]=array_values(array_unique(array_merge(Policy::fieldReasons($p,$field,$bundlePricing),$access['reasons'])));
+                if ($bundlePricing && isset($promotionMap[$id]) && in_array($field,['regular_price','sale_price'],true)) { $fieldReasons[$field][]=TemporarySales::INLINE_PRICE_BLOCK; }
                 if (!Policy::accessible((int)$id,true)) { $fieldReasons[$field][]='ไม่มีสิทธิ์แก้ไขสินค้านี้หรือสินค้าแม่'; }
                 $editable[$field]=!$fieldReasons[$field]; $reasons=array_merge($reasons,$fieldReasons[$field]); $revisions[$field]=(string)($revisionMap[$id][$field]??'0');
             }
             $terms=wp_get_post_terms($taxId,'product_tag',['fields'=>'all']);$brands=[];
             if (!is_wp_error($terms)) { foreach ($terms as $term) { if (in_array((int)$term->term_id,Policy::settings()['brand_ids']??[],true)) { $brands[]=$term->name; } } }
             $image=wp_get_attachment_image_url($p->get_image_id(),'thumbnail');
-            $items[]=['id'=>(string)$id,'parent_id'=>$parent?(string)$parent:null,'type'=>$p->get_type(),'name'=>$p->get_name('edit'),'attributes'=>$p->is_type('variation')?wc_get_formatted_variation($p,true,false,false):'','sku'=>$p->get_sku('edit'),'brands'=>$brands,'thumbnail_url'=>$image&&wp_http_validate_url($image)?esc_url_raw($image):null,'edit_url'=>Policy::accessible((int)$id,true)?admin_url('post.php?post='.$taxId.'&action=edit'):null] + Policy::values($p) + ['revisions'=>$revisions,'editable'=>$editable,'readonly_reasons'=>array_values(array_unique($reasons)),'field_readonly_reasons'=>$fieldReasons,'sale_schedule'=>Policy::schedule($p),'current_price'=>$p->is_type('variable')?null:$p->get_price('edit'),'variation_summary'=>$p->is_type('variable')?self::summary((int)$id):null,'temporary_sale'=>$promotionMap[$id]??null,'latest_change'=>$recentMap[$id]??null];
+            $stockByQuantity=$p->is_type(['simple','variation']) && Policy::stockByQuantity($p);
+            $stockQuantity=$p->managing_stock() ? $p->get_stock_quantity() : null;
+            if ($bundlePricing && is_callable([$p,'get_bundle_stock_quantity'])) {
+                // Read the synchronized quantity without triggering a stock write from the catalog endpoint.
+                $stockQuantity=$p->get_bundled_items_stock_sync_status()==='unsynced' ? null : $p->get_bundle_stock_quantity('edit');
+            }
+            $stockQuantity=is_numeric($stockQuantity) ? max(0,0+$stockQuantity) : null;
+            $stockQuantityShared=$p->is_type('variable') || ($parent && $p->get_stock_managed_by_id()===$parent);
+            $bundleItemPricing=$p->is_type('bundle') && is_callable([$p,'contains']) && $p->contains('priced_individually');
+            $items[]=['id'=>(string)$id,'parent_id'=>$parent?(string)$parent:null,'type'=>$p->get_type(),'name'=>$p->get_name('edit'),'attributes'=>$p->is_type('variation')?wc_get_formatted_variation($p,true,false,false):'','sku'=>$p->get_sku('edit'),'brands'=>$brands,'thumbnail_url'=>$image&&wp_http_validate_url($image)?esc_url_raw($image):null,'storefront_url'=>esc_url_raw($p->get_permalink()),'edit_url'=>Policy::accessible((int)$id,true)?admin_url('post.php?post='.$taxId.'&action=edit'):null] + Policy::values($p) + ['revisions'=>$revisions,'editable'=>$editable,'readonly_reasons'=>array_values(array_unique($reasons)),'field_readonly_reasons'=>$fieldReasons,'sale_schedule'=>Policy::schedule($p),'current_price'=>$p->is_type('variable')?null:$p->get_price('edit'),'variation_summary'=>$p->is_type('variable')?self::summary((int)$id):null,'temporary_sale'=>$promotionMap[$id]??null,'latest_change'=>$recentMap[$id]??null,
+                'stock_by_quantity'=>$stockByQuantity,'stock_quantity'=>$stockQuantity,'stock_quantity_shared'=>$stockQuantityShared,'bundle_item_pricing'=>$bundleItemPricing,'bundle_temp_promo'=>$bundlePricing];
         }
         return $items;
+    }
+    public static function matchingAccessibleProducts(string $condition, bool $write): array {
+        global $wpdb;
+        $ids=[]; $cursor=0;
+        do {
+            $rows=$wpdb->get_col("SELECT p.ID FROM $wpdb->posts p
+                WHERE p.ID>$cursor AND p.post_status='publish' AND p.post_type IN ('product','product_variation')
+                AND ($condition) ORDER BY p.ID LIMIT 50");
+            foreach ($rows as $row) {
+                $cursor=(int)$row;
+                if (Policy::accessible($cursor,$write)) { $ids[]=$cursor; }
+                if (count($ids)===2) { return $ids; }
+            }
+        } while (count($rows)===50);
+        return $ids;
+    }
+    public static function skuMatches(string $sku, bool $write = false): array {
+        if ($sku === '' || strlen($sku) > 200) { return []; }
+        global $wpdb;
+        return self::matchingAccessibleProducts($wpdb->prepare("EXISTS (SELECT 1 FROM $wpdb->postmeta m
+            WHERE m.post_id=p.ID AND m.meta_key='_sku' AND BINARY m.meta_value=%s)",$sku),$write);
     }
     public static function product(int $id): array|\WP_Error {
         if (!current_user_can('sdd_view_products') || !Policy::accessible($id)) { return API::error('not_found','ไม่พบสินค้าที่เข้าถึงได้',404); }
@@ -314,7 +354,14 @@ final class Catalog {
             $tabCounts=array_map('intval',$wpdb->get_row('SELECT '.implode(',',$columns),ARRAY_A)??[]);
         }
         $total=$tabCounts[$q['scope']]??(int)$wpdb->get_var("SELECT COUNT(*) FROM $wpdb->posts p WHERE $sql");
-        return ['tab_counts'=>$tabCounts,'items'=>self::rows(self::select($q,$sql,true),$access,$q),'total'=>$total,'catalog_total'=>$count,'pages'=>(int)ceil($total/$q['size']),'page'=>$q['page'],'per_page'=>$q['size'],'brand_configured'=>!empty(Policy::settings()['brand_ids']),'write_access'=>$access,'server_time'=>gmdate('Y-m-d\TH:i:s\Z')];
+        $exactSku = null;
+        if ($q['search'] !== '' && $q['scope'] === 'all' && !$tax && $q['status'] === '' && $q['promotion'] === '' && $q['source'] === '') {
+            $matches = self::skuMatches($q['search']);
+            if (count($matches) === 1 && Policy::accessible($matches[0])) {
+                $exactSku = self::rows($matches,$access)[0] ?? null;
+            }
+        }
+        return ['exact_sku'=>$exactSku,'tab_counts'=>$tabCounts,'items'=>self::rows(self::select($q,$sql,true),$access,$q),'total'=>$total,'catalog_total'=>$count,'pages'=>(int)ceil($total/$q['size']),'page'=>$q['page'],'per_page'=>$q['size'],'brand_configured'=>!empty(Policy::settings()['brand_ids']),'write_access'=>$access,'server_time'=>gmdate('Y-m-d\TH:i:s\Z')];
     }
     public static function variations(int $parentId,array $input): array|\WP_Error {
         global $wpdb;

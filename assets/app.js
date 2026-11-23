@@ -4,6 +4,32 @@
 const {createElement:h, useState, useEffect, useRef} = wp.element;
 const cfg = window.SDD_CONFIG;
 const drafts = new Map();
+const pendingPricePrefix='sdd-price-command:'+cfg.api+':'+cfg.userId+':';
+function pendingPriceCommands(){
+ const rows=[];
+ try{
+  for(let i=0;i<localStorage.length;i++){
+   const stored=localStorage.key(i);
+   if(!stored?.startsWith(pendingPricePrefix))continue;
+   const match=/^(\d+:(?:regular_price|sale_price|sale_dates|stock_status))(?::([a-f0-9-]{36}))?$/.exec(stored.slice(pendingPricePrefix.length));
+   const operation_id=match&&(match[2]||localStorage.getItem(stored));
+   if(operation_id&&/^[a-f0-9-]{36}$/.test(operation_id))rows.push({key:match[1],operation_id});
+  }
+ }catch{}
+ return rows;
+}
+for(const {key,operation_id} of pendingPriceCommands()){
+ if(!drafts.has(key))drafts.set(key,{state:'unknown',recovering:true,operation:{operation_id},message:'มีคำสั่งที่ส่งไว้ กรุณาตรวจผลเดิมก่อนแก้ราคา'});
+}
+function rememberPriceCommand(key,id,remove=false){
+ if(!id)return;
+ try{
+  if(remove){
+   localStorage.removeItem(pendingPricePrefix+key+':'+id);
+   if(localStorage.getItem(pendingPricePrefix+key)===id)localStorage.removeItem(pendingPricePrefix+key);
+  }else localStorage.setItem(pendingPricePrefix+key+':'+id,'1');
+ }catch{}
+}
 const workspacePresence = new Map();
 const cacheUpdates = new Map();
 function cacheUpdateText(update){
@@ -16,24 +42,28 @@ function markCachePending(id,noop=false){
  cacheUpdates.set(String(id),{state:'pending'});
  window.dispatchEvent(new CustomEvent('sdd:cache-update'));
 }
-function CacheUpdateStatus({id,detail=false,compact=false}){
+function CacheUpdateStatus({id,detail=false,compact=false,onJob}){
  const [,refresh]=useState(0);
  useEffect(()=>{const update=()=>refresh(n=>n+1);window.addEventListener('sdd:cache-update',update);return()=>window.removeEventListener('sdd:cache-update',update);},[id]);
  const update=cacheUpdates.get(String(id)),message=cacheUpdateText(update);
  if(!message||(compact&&['accepted','simulated','closed'].includes(update.state)))return null;
  const tone=['needs_attention','retry_wait','unavailable'].includes(update.state)?'attention':'pending';
- return h('small',{className:'sdd-cache-status '+tone,role:'status','data-cache-state':update.state},message,detail&&update.updated_at&&h('span',null,' · '+displayDate(update.updated_at)));
+ return h('small',{className:'sdd-cache-status '+tone,role:'status','data-cache-state':update.state},message,detail&&update.updated_at&&h('span',null,' · '+displayDate(update.updated_at)),onJob&&update.job_id&&h('button',{type:'button',onClick:()=>onJob(update.job_id)},'ดูงานนี้ในคิว'));
 }
 function CacheQueueSummary({data}){
  if(!data||data.state==='disabled')return null;
  const attention=Number(data.attention)||0;
  const waiting=Math.max(0,(Number(data.pending)||0)-attention);
+ const status=data.operational_state;
  return h('div',{className:'sdd-cache-summary'},
   data.state==='unavailable'?h('p',null,'ยังตรวจสถานะการอัปเดตราคาบนหน้าร้านไม่ได้'):h('div',{className:'sdd-cache-counts'},
    h('p',null,h('strong',null,waiting),' รายการกำลังรอส่งหรือกำลังส่ง'),
    h('p',{className:attention?'sdd-cache-count-alert':undefined},h('strong',null,attention),' รายการต้องตรวจสอบ')),
   data.dry_run&&h('p',null,'ทดลองอยู่ · ยังไม่ได้ส่งคำขอไป Cloudflare'),
-  !data.dispatch_enabled&&data.pending>0&&h('p',null,'พักส่งคำขอ · รายการที่รอยังอยู่'));
+  status==='paused_error'&&h('p',{className:'sdd-cache-count-alert'},'พักส่งคำขอ · ตรวจการเชื่อมต่อ Cloudflare'),
+  status==='stalled'&&h('p',{className:'sdd-cache-count-alert'},'งานส่งคำขอเบื้องหลังล่าช้า'),
+  status==='unavailable'&&data.state!=='unavailable'&&h('p',{className:'sdd-cache-count-alert'},'ระบบส่งคำขอเบื้องหลังไม่พร้อม'),
+  status!=='paused_error'&&!data.dispatch_enabled&&data.pending>0&&h('p',null,'พักส่งคำขอ · รายการที่รอยังอยู่'));
 }
 function cacheRemedy(code){
  return ({
@@ -50,7 +80,7 @@ function cacheRemedy(code){
   replay_limit:'งานนี้ลองส่งครบจำนวนแล้ว ให้ผู้ดูแลตรวจสาเหตุ',
  })[code]||'ให้ผู้ดูแลตรวจสถานะระบบก่อนลองส่งอีกครั้ง';
 }
-function CacheSettings(){
+function CacheSettings({jobId}={}){
  const [data,setData]=useState(null);
  const [draft,setDraft]=useState({});
  const [busy,setBusy]=useState('');
@@ -61,13 +91,21 @@ function CacheSettings(){
  const [token,setToken]=useState('');
  const [page,setPage]=useState(1);
  const [filter,setFilter]=useState('all');
+ const [job,setJob]=useState(jobId||'');
  const connectionPanel=useRef(null);
+ const openedJob=useRef(false),jobHeading=useRef(null);
  const live=useRef(true);
  useEffect(()=>{
   live.current=true;
   run('refresh',()=>read());
   return()=>{live.current=false;};
  },[]);
+ useEffect(()=>{
+  if(!data||!job||openedJob.current)return;
+  openedJob.current=true;
+  jobHeading.current?.focus();
+  jobHeading.current?.scrollIntoView?.({block:'nearest'});
+ },[data,job]);
  const settings=data?.settings;
  const form=settings?{...settings,...draft}:null;
  const queue=data?.queue;
@@ -78,14 +116,15 @@ function CacheSettings(){
  const zone=zoneDraft??data?.connection?.zone_id??'';
  const hasChanges=!!settings&&(Object.keys(draft).some(key=>draft[key]!==settings[key])||extraDraft!==null&&extraDraft!==settings.extra_urls.join('\n'));
 
- async function read(nextPage=page,nextFilter=filter){
+ async function read(nextPage=page,nextFilter=filter,nextJob=job){
   const params=new URLSearchParams({page:nextPage,filter:nextFilter});
+  if(nextJob)params.set('job_id',String(nextJob));
   const result=await api('cache-health?'+params);
   if(!live.current)return;
   cfg.cacheCapture=result.settings.capture_enabled;
   setData(result);
   setPage(result.jobs_pagination?.page??nextPage);
-  setFilter(nextFilter);
+  setFilter(nextFilter);setJob(nextJob);
  }
  async function run(action,perform,success=''){
   setBusy(action);
@@ -214,6 +253,7 @@ function CacheSettings(){
   h('div',{className:'sdd-cache-overview'},
    h('div',{role:'status'},h('strong',null,statusTitle),statusDetail&&h('p',null,statusDetail)),statusAction),
   h(CacheQueueSummary,{data:queue}),
+  job&&h('div',{className:'sdd-import-actions'},h('strong',{tabIndex:-1,ref:jobHeading},'งานอัปเดตหน้าร้าน #'+job),h('button',{disabled:!!busy,onClick:()=>run('refresh',()=>read(1,'all',''))},'ดูคิวทั้งหมด')),
   data&&h('section',{className:'sdd-cache-jobs','aria-label':'คิวอัปเดตหน้าร้าน'},
    h('div',{className:'sdd-card-heading'},h('h4',null,'คิวอัปเดตหน้าร้าน'),
     h('label',null,'แสดงงาน ',h('select',{value:filter,disabled:!!busy,onChange:e=>refresh(1,e.target.value)},
@@ -272,7 +312,19 @@ function CacheSettings(){
 }
 function mergeLiveRows(rows,update){
  const changed=new Map(update.items.map(r=>[r.id,r])),missing=new Set(update.unavailable);
- return rows.filter(r=>!missing.has(r.id)).map(row=>{const next=changed.get(row.id);if(!next)return row;const merged={...row,...next,latest_change:next.latest_change??row.latest_change};for(const field of Object.keys(row.revisions||{})){if(BigInt(next.revisions?.[field]||'0')<BigInt(row.revisions[field]||'0')){merged[field]=row[field];merged.revisions={...merged.revisions,[field]:row.revisions[field]};}}return merged;});
+ return rows.filter(r=>!missing.has(r.id)).map(row=>{
+  const next=changed.get(row.id);if(!next)return row;
+  if(Object.keys(row.revisions||{}).some(field=>BigInt(next.revisions?.[field]||'0')<BigInt(row.revisions[field]||'0')))return row;
+  return {...row,...next,latest_change:next.latest_change??row.latest_change};
+ });
+}
+function applyPriceRow(row,id,field,value,revision,result){
+ if(row.id!==id||BigInt(row.revisions[field]||'0')>BigInt(revision||'0'))return row;
+ const coherent=result?.revisions&&['regular_price','sale_price','sale_dates'].every(key=>BigInt(result.revisions[key]||'0')>=BigInt(row.revisions[key]||'0'));
+ return {...row,[field]:value,revisions:{...row.revisions,[field]:revision},
+  ...(coherent&&typeof result.current_price==='string'?{current_price:result.current_price}:{}),
+  ...(result?.event_id&&result.changed_at?{latest_change:result.changed_at}:{}),
+  ...(result?.temporary_sale?{temporary_sale:result.temporary_sale}:{})};
 }
 const signalDraft=id=>window.dispatchEvent(new CustomEvent('sdd:draft-update',{detail:String(id)}));
 const stock = {instock:'มีสินค้า', outofstock:'สินค้าหมด', onbackorder:'สั่งจองได้'};
@@ -360,27 +412,48 @@ const datePart=token=>{
 };
 const datePair=value=>(value||'|').split('|').map(datePart);
 const showValue=(v,f)=>f==='sale_dates'?scheduleLabel(v):f==='stock_status'?(stock[v]||v):v===''?'—':/^\d+$/.test(v)?BigInt(v).toLocaleString('en-US'):v;
-function Cell({row,field,onSaved}) {
+function Cell({row,field,onSaved,canWrite}) {
  const key=row.id+':'+field;
  const [,render]=useState(0); const mounted=useRef(true);
  useEffect(()=>{mounted.current=true;const changed=e=>{if(e.detail===row.id)render(x=>x+1);};window.addEventListener('sdd:draft-update',changed);return()=>{mounted.current=false;window.removeEventListener('sdd:draft-update',changed);};},[row.id]);
  let d=drafts.get(key);
  if (!d) { d={value:row[field],base:row[field],revision:row.revisions[field],generation:0,state:'clean',message:'',operation:null,conflict:null}; drafts.set(key,d); }
+ if(d.recovering){Object.assign(d,{base:row[field],value:row[field],revision:row.revisions[field],generation:0,sentGeneration:0,recovering:false});}
  if (d.state==='clean' && !d.busy) { d.value=row[field];d.base=row[field];d.revision=row.revisions[field]; }
  if(['dirty','error'].includes(d.state)&&!d.busy&&(d.base!==row[field]||d.revision!==row.revisions[field])){d.state='conflict';d.conflict={current_value:row[field],current_revision:row.revisions[field],changed_by:null,changed_at:null};d.message='มีข้อมูลใหม่ ตรวจราคาปัจจุบันก่อนบันทึก';}
  const refresh=()=>{if(mounted.current)render(x=>x+1);};
+ function clearCommand(){
+  rememberPriceCommand(key,d.operation?.operation_id,true);
+  d.operation=null;d.canAbandon=false;
+ }
+ function surfaceOtherCommand(){
+  const next=pendingPriceCommands().find(command=>command.key===key);
+  if(next){d.operation={operation_id:next.operation_id};d.sentGeneration=d.generation;d.state='unknown';d.canAbandon=false;d.message='ยังมีอีกคำสั่งในช่องนี้ กรุณาตรวจผลเดิม';}
+ }
  const applyResult=(result,generation)=>{
-  d.base=result.new_value;d.revision=result.revision;d.operation=null;d.conflict=null;
+  d.base=result.new_value;d.revision=result.revision;clearCommand();d.conflict=null;
   if(d.generation===generation){d.value=result.new_value;d.state='clean';d.message='บันทึกแล้ว';}else{d.state='dirty';d.message='ค่าที่พิมพ์ใหม่ยังไม่ได้บันทึก';}
-  markCachePending(row.id,result.noop);onSaved(row.id,field,result.new_value,result.revision);refresh();
+  surfaceOtherCommand();
+  markCachePending(row.id,result.noop);
+  onSaved(row.id,field,result.new_value,result.revision,result);refresh();
  };
  async function inspect() {
   if(!d.operation || d.busy)return;d.busy=true;
   try {const response=await api('operations/'+d.operation.operation_id);
    if(response.result?.ok){applyResult(response.result,d.sentGeneration);}
-   else if(response.result?.code){fail(new ApiError(response.result,response.result.data?.status||400));d.operation=null;}
-   else{d.state='unknown';d.message='ยังยืนยันผลบันทึกไม่ได้ ให้ผู้ดูแลตรวจสอบรายการเดิมก่อนบันทึกอีกครั้ง';}
-  }catch(e){d.state='unknown';d.message='ตรวจผลไม่ได้: '+e.message;}
+   else if(response.result?.code){fail(new ApiError(response.result,response.result.data?.status||400));clearCommand();surfaceOtherCommand();}
+   else{d.canAbandon=false;d.state='unknown';d.message='ยังยืนยันผลบันทึกไม่ได้ ให้ผู้ดูแลตรวจสอบรายการเดิมก่อนบันทึกอีกครั้ง';}
+  }catch(e){d.state='unknown';d.canAbandon=e.status===404&&e.code==='not_found';d.message=d.canAbandon?'ยังไม่พบคำสั่งนี้ในระบบ ตรวจอีกครั้ง หรือยกเลิกคำสั่งที่ยังไม่เริ่ม':'ตรวจผลไม่ได้: '+e.message;}
+  finally{d.busy=false;refresh();signalDraft(row.id);}
+ }
+ async function abandon(){
+  if(!d.canAbandon||d.busy||!d.operation)return;
+  if(!await confirmChange('ระบบจะยกเลิกได้เมื่อคำสั่งนี้ยังไม่มีผลบันทึก ราคาที่ใช้อยู่จะคงเดิม',{title:'ยกเลิกคำสั่งที่ยังไม่เริ่ม?',confirmLabel:'ยืนยันยกเลิกคำสั่ง'}))return;
+  d.busy=true;
+  try{
+   const result=await api('products/'+row.id+'/commands/'+d.operation.operation_id+'/abandon',{confirmed:true});
+   if(result.cancelled){clearCommand();d.state='clean';d.message='ยกเลิกคำสั่งเดิมแล้ว';surfaceOtherCommand();}
+  }catch(e){d.canAbandon=false;d.message=e.message;}
   finally{d.busy=false;refresh();signalDraft(row.id);}
  }
  function fail(e) {
@@ -390,7 +463,7 @@ function Cell({row,field,onSaved}) {
   else{d.state='error';d.message=e.message+(e.data.request_id?' · '+e.data.request_id:'');}
  }
  async function commit() {
-  if(d.busy || d.state==='unknown' || d.state==='conflict' || d.value===d.base)return;
+  if((canWrite&&!canWrite()) || d.busy || d.state==='unknown' || d.state==='conflict' || d.value===d.base)return;
   if(field!=='stock_status' && field!=='sale_dates' && !((field==='sale_price'&&d.value==='') || /^(0|[1-9][0-9]{0,14})$/.test(d.value))){d.state='error';d.message='กรอกราคาเป็นจำนวนเต็มไม่เกิน 15 หลัก เช่น 14,900 โดยไม่ใส่ทศนิยม';refresh();return;}
   if(!d.operation){
    const acks=[];
@@ -398,14 +471,16 @@ function Cell({row,field,onSaved}) {
     if(!await confirmChange('วันราคาโปร ของ '+row.name+'\n'+showValue(d.base,field)+' → '+showValue(d.value,field)+'\nเขตเวลา '+(cfg.timezone||'UTC')+' · วันใหม่เริ่ม 00:00 / สิ้นสุด 23:59:59\nเปลี่ยนหรือล้างวันอาจทำให้โปรเริ่มหรือหยุดทันที ยืนยันบันทึก?')){d.state='dirty';refresh();return;}
     acks.push('schedule_change');
    } else if(field!=='stock_status'){
-    if(!await confirmChange(labels[field]+' ของ '+row.name+'\n'+showValue(d.base,field)+' → '+showValue(d.value,field)+(d.value==='0'?'\nคำเตือน: ราคาจะเป็นศูนย์':'')+(['active','future'].includes(row.sale_schedule?.state)?'\nคงวันโปรเดิม: '+showValue(row.sale_dates,'sale_dates')+' ('+(cfg.timezone||'UTC')+')'+(row.sale_schedule.state==='active'?'\nโปรกำลังทำงาน: การเปลี่ยนราคาอาจมีผลทันที':'\nโปรอนาคต: ราคาโปรจะใช้ตามวันเริ่มเดิม'):'')+(row.sale_schedule?.state==='expired'?'\nเวลาโปรเดิมหมดอายุแล้ว ('+displayDate(row.sale_schedule.to)+')\nระบบคงเวลาเดิม: แก้ราคาโปรแล้วโปรจะยังไม่เริ่มใหม่ หากต้องการเริ่มโปรเดิมอีกครั้ง ให้แก้วันโปรใน WooCommerce':'')+(['pending','active'].includes(row.temporary_sale?.status)?'\nมีโปรชั่วคราวอยู่: การแก้ราคาจะหยุดการคืนอัตโนมัติให้ตรวจสอบ':'')+'\nยืนยันบันทึกราคานี้?')){d.state='dirty';refresh();return;}
+    if(!await confirmChange(labels[field]+' ของ '+row.name+'\n'+showValue(d.base,field)+' → '+showValue(d.value,field)+(row.type==='bundle'?'\nรายการนี้เปลี่ยนราคาฐานของชุด':'')+(row.bundle_item_pricing?'\nราคาสินค้าในชุดยังบวกเพิ่มตามการตั้งค่า':'')+(d.value==='0'?'\nคำเตือน: ราคาจะเป็นศูนย์':'')+(['active','future'].includes(row.sale_schedule?.state)?'\nคงวันโปรเดิม: '+showValue(row.sale_dates,'sale_dates')+' ('+(cfg.timezone||'UTC')+')'+(row.sale_schedule.state==='active'?'\nโปรกำลังทำงาน: การเปลี่ยนราคาอาจมีผลทันที':'\nโปรอนาคต: ราคาโปรจะใช้ตามวันเริ่มเดิม'):'')+(row.sale_schedule?.state==='expired'?'\nเวลาโปรเดิมหมดอายุแล้ว ('+displayDate(row.sale_schedule.to)+')\nระบบคงเวลาเดิม: แก้ราคาโปรแล้วโปรจะยังไม่เริ่มใหม่ หากต้องการเริ่มโปรเดิมอีกครั้ง ให้แก้วันโปรใน WooCommerce':'')+(['pending','active'].includes(row.temporary_sale?.status)?'\nมีโปรชั่วคราวอยู่: การแก้ราคาจะหยุดการคืนอัตโนมัติให้ตรวจสอบ':'')+'\nยืนยันบันทึกราคานี้?')){d.state='dirty';refresh();return;}
     acks.push('price_change');if(row.sale_schedule?.state==='expired')acks.push('expired_schedule');if(d.value==='0')acks.push('zero_price');
    }
+   if(!mounted.current||(canWrite&&!canWrite()))return;
    d.operation={operation_id:uuid(),field,value:d.value,base_value:d.base,base_revision:d.revision,acknowledgements:acks};d.sentGeneration=d.generation;
   }
+  rememberPriceCommand(key,d.operation.operation_id);
   d.busy=true;d.state='saving';d.message='กำลังบันทึก';refresh();
   try{const result=await api('products/'+row.id+'/field',d.operation);applyResult(result,d.sentGeneration);}
-  catch(e){fail(e);if(e instanceof ApiError && ![401,403,429,503].includes(e.status) && e.code!=='operation_unknown'){d.operation=null;}}
+  catch(e){fail(e);if(d.state!=='unknown')rememberPriceCommand(key,d.operation?.operation_id,true);if(e instanceof ApiError && ![401,403,429,503].includes(e.status) && e.code!=='operation_unknown'){d.operation=null;}}
   finally{d.busy=false;refresh();signalDraft(row.id);}
  }
  function change(value){d.value=value;d.generation++;if(d.state!=='saving'&&d.state!=='unknown'&&d.state!=='conflict'){d.state=value===d.base?'clean':'dirty';d.operation=null;d.message='';}refresh();signalDraft(row.id);}
@@ -419,27 +494,26 @@ function Cell({row,field,onSaved}) {
   d.message&&h('div',{className:'sdd-cell-message','aria-live':'polite'},d.message),
   ['dirty','error'].includes(d.state)&&h('button',{type:'button',className:'sdd-small',onMouseDown:e=>e.preventDefault(),onClick:commit},'บันทึก'),
   ['dirty','error'].includes(d.state)&&h('button',{className:'sdd-small',onMouseDown:e=>e.preventDefault(),onClick:reset},'ยกเลิก'),
-  d.state==='unknown'&&h('button',{className:'sdd-small',onClick:inspect},'ตรวจผลคำสั่ง'),
+  d.state==='unknown'&&h('button',{className:'sdd-small',onClick:inspect},'ตรวจผลคำสั่ง'),d.state==='unknown'&&d.canAbandon&&h('button',{className:'sdd-small',onClick:abandon},'ยกเลิกคำสั่งที่ยังไม่เริ่ม'),
   d.state==='error'&&d.operation&&h('button',{className:'sdd-small',onClick:inspect},'ตรวจผลก่อนลองใหม่'),
   d.state==='conflict'&&h('div',{className:'sdd-conflict'},'ปัจจุบัน '+showValue(d.conflict.current_value,field)+' / ที่พิมพ์ '+showValue(d.value,field),h('button',{onClick:useCurrent},'ใช้ค่าปัจจุบัน'),h('button',{onClick:rebase},'เก็บค่าที่พิมพ์ไว้และตรวจใหม่')));
 }
-function Setup({onClose,onSaved}){
+function Setup({onClose,onSaved,jobId}){
  const [settings,setSettings]=useState(null),[terms,setTerms]=useState([]),[selected,setSelected]=useState(new Set()),[enableAck,setEnableAck]=useState(false),[error,setError]=useState(''),[success,setSuccess]=useState(''),[busy,setBusy]=useState(false),[search,setSearch]=useState(''),[health,setHealth]=useState(null),[healthError,setHealthError]=useState(''),[healthBusy,setHealthBusy]=useState(true);
  const [settingsLoading,setSettingsLoading]=useState(true),[settingsError,setSettingsError]=useState(''),[termsLoading,setTermsLoading]=useState(true),[termsError,setTermsError]=useState('');
  const settingsGeneration=useRef(0);
- const loadSettings=async()=>{const generation=++settingsGeneration.current;setSettingsLoading(true);setSettingsError('');try{const result=await api('settings');if(generation===settingsGeneration.current)setSettings(result);}catch(e){if(generation===settingsGeneration.current)setSettingsError(e.message);}finally{if(generation===settingsGeneration.current)setSettingsLoading(false);}};
+ const loadSettings=async()=>{const generation=++settingsGeneration.current;setSettingsLoading(true);setSettingsError('');try{const result=await api('settings');if(generation===settingsGeneration.current){setSettings(result);setSelected(new Set((result.settings.brand_ids||[]).map(String)));}}catch(e){if(generation===settingsGeneration.current)setSettingsError(e.message);}finally{if(generation===settingsGeneration.current)setSettingsLoading(false);}};
  const healthGeneration=useRef(0);
  const loadHealth=async()=>{const generation=++healthGeneration.current;setHealthBusy(true);try{const result=await api('health');if(generation===healthGeneration.current){setHealth(result);setHealthError('');}}catch(e){if(generation===healthGeneration.current){setHealthError(e.message);}}finally{if(generation===healthGeneration.current)setHealthBusy(false);}};
  useEffect(()=>{let live=true;loadSettings();(async()=>{let result=[],page=1,pages=1;do{const r=await api('brand-terms?page='+page);result.push(...r.items);pages=r.pages;page++;}while(page<=pages&&page<=20);return result;})().then(t=>{if(live)setTerms(t);}).catch(e=>{if(live)setTermsError(e.message);}).finally(()=>{if(live)setTermsLoading(false);});loadHealth();return()=>{live=false;settingsGeneration.current++;healthGeneration.current++;};},[]);
- useEffect(()=>{if(settings)setSelected(new Set((settings.settings.brand_ids||[]).map(String)));},[settings]);
  const stopped=settings?settings.settings.write_stop!==false:null;
  const blockers=[...new Set([...(settings&&!settings.schema_ready?['โครงสร้างฐานข้อมูลยังไม่พร้อม']:[]),...(health?.enable_reasons||[])])];
  const checking=settingsLoading||healthBusy,unavailable=!!settingsError||!!healthError;
  const canEnable=!!settings&&!!health&&!checking&&!unavailable&&!blockers.length&&enableAck;
- async function persist(nextStop,nextAck,message){setBusy(true);setError('');setSuccess('');try{const updated=await api('settings',{brand_ids:[...selected],write_stop:nextStop,local_ack:nextAck});setSettings(updated);setSuccess(message);onSaved();await loadHealth();return true;}catch(e){const reasons=e.data?.blockers||[];setError(e.message+(reasons.length?' · '+reasons.join(' · '):''));await loadHealth();return false;}finally{setBusy(false);}}
- async function save(){return persist(stopped,!!settings?.settings?.local_ack,'บันทึกการตั้งค่าแบรนด์แล้ว โดยคงสถานะการแก้ไขเดิม');}
- async function enableEditing(){if(!enableAck){setError('ทำเครื่องหมายยืนยันก่อนเปิดให้แก้ไขสินค้า');return;}if(blockers.length){setError('ยังเปิดให้แก้ไขไม่ได้: '+blockers.join(' · '));return;}if(!await confirmChange('กำลังเปิดสิทธิ์แก้ไขสินค้าและราคาให้ผู้ใช้ที่มีสิทธิ์\nก่อนยืนยัน โปรดตรวจว่า backup และขั้นตอนกู้คืนพร้อมแล้ว\nยืนยันเปิดให้แก้ไขสินค้า?'))return;const ok=await persist(false,true,'เปิดให้แก้ไขสินค้าแล้ว');if(ok)setEnableAck(false);}
- async function pauseEditing(){if(!await confirmChange('หยุดการแก้ไขสินค้าและราคาไว้ชั่วคราวหรือไม่? ผู้ใช้ยังดูข้อมูลได้ แต่จะบันทึกไม่ได้ และโปรจะหยุดเริ่มหรือคืนราคาอัตโนมัติจนกว่าจะเปิดอีกครั้ง',{title:'หยุดการแก้ไขและงานราคา',confirmLabel:'ยืนยันหยุดชั่วคราว'}))return;await persist(true,!!settings?.settings?.local_ack,'หยุดการแก้ไขสินค้าแล้ว');setEnableAck(false);}
+ async function persist(values,message){setBusy(true);setError('');setSuccess('');try{const updated=await api('settings',values);setSettings(updated);if('brand_ids' in values)setSelected(new Set((updated.settings.brand_ids||[]).map(String)));setSuccess(message);onSaved();await loadHealth();return true;}catch(e){const reasons=e.data?.blockers||[];setError(e.message+(reasons.length?' · '+reasons.join(' · '):''));await loadHealth();return false;}finally{setBusy(false);}}
+ async function save(){return persist({brand_ids:[...selected]},'บันทึกการตั้งค่าแบรนด์แล้ว โดยคงสถานะการแก้ไขเดิม');}
+ async function enableEditing(){if(!enableAck){setError('ทำเครื่องหมายยืนยันก่อนเปิดให้แก้ไขสินค้า');return;}if(blockers.length){setError('ยังเปิดให้แก้ไขไม่ได้: '+blockers.join(' · '));return;}if(!await confirmChange('กำลังเปิดสิทธิ์แก้ไขสินค้าและราคาให้ผู้ใช้ที่มีสิทธิ์\nก่อนยืนยัน โปรดตรวจว่า backup และขั้นตอนกู้คืนพร้อมแล้ว\nยืนยันเปิดให้แก้ไขสินค้า?'))return;const ok=await persist({write_stop:false,local_ack:true},'เปิดให้แก้ไขสินค้าแล้ว');if(ok)setEnableAck(false);}
+ async function pauseEditing(){if(!await confirmChange('หยุดการแก้ไขสินค้าและราคาไว้ชั่วคราวหรือไม่? ผู้ใช้ยังดูข้อมูลได้ แต่จะบันทึกไม่ได้ และโปรจะหยุดเริ่มหรือคืนราคาอัตโนมัติจนกว่าจะเปิดอีกครั้ง',{title:'หยุดการแก้ไขและงานราคา',confirmLabel:'ยืนยันหยุดชั่วคราว'}))return;await persist({write_stop:true},'หยุดการแก้ไขสินค้าแล้ว');setEnableAck(false);}
  const visibleTerms=terms.filter(t=>t.name.toLowerCase().includes(search.toLowerCase()));
  const allVisibleSelected=visibleTerms.length>0&&visibleTerms.every(t=>selected.has(t.id));
  return h('section',{className:'sdd-setup','aria-label':'ตั้งค่า'},h('header',{className:'sdd-setup-heading'},h('div',null,h('h2',null,'ตั้งค่าการใช้งาน'),h('p',null,'ตั้งค่าแบรนด์ ตรวจความพร้อม และควบคุมการแก้ไขสินค้า'))),
@@ -452,8 +526,8 @@ function Setup({onClose,onSaved}){
  checking?h('p',null,'รอผลตรวจสักครู่ ยังไม่มีการเปลี่ยนการตั้งค่า'):unavailable?h('div',null,h('p',null,healthError||settingsError),h('button',{onClick:()=>{loadSettings();loadHealth();}},'ลองตรวจความพร้อมอีกครั้ง')):blockers.length?h('ul',null,blockers.map((reason,i)=>h('li',{key:reason+i},reason))):h('p',null,'ระบบพร้อมในส่วนที่ปลั๊กอินตรวจได้ โปรดตรวจ backup และวิธีกู้คืนของร้านด้วย')),
  h('label',{className:'sdd-enable-ack'},h('input',{type:'checkbox',checked:enableAck,disabled:busy||checking||unavailable||!!blockers.length,onChange:e=>setEnableAck(e.target.checked)}),' ฉันตรวจสอบ backup และเข้าใจว่าการเปิดนี้อนุญาตให้ผู้มีสิทธิ์แก้ไขข้อมูลสินค้า'),h('button',{type:'button',className:'sdd-primary',disabled:busy||!canEnable,onClick:enableEditing},busy?'กำลังตรวจและบันทึก…':'เปิดให้แก้ไขสินค้า')):h('div',{className:'sdd-write-actions'},h('p',null,'ผู้ใช้ที่มีสิทธิ์สามารถแก้ไขสินค้าได้'),h('button',{type:'button',className:'sdd-danger-button',disabled:busy||settingsLoading||!!settingsError,onClick:pauseEditing},busy?'กำลังบันทึก…':'หยุดการแก้ไขชั่วคราว')))),
  h('section',{className:'sdd-setup-card','aria-labelledby':'sdd-environment-heading'},h('div',{className:'sdd-card-heading'},h('h3',{id:'sdd-environment-heading'},'สภาพแวดล้อม'),h('span',{className:'sdd-setup-version'},'ปลั๊กอิน '+(health?.version||settings?.version||'—'))),h('div',{className:'sdd-environment-grid'},[['PHP',health?.runtime?.php||settings?.php],['WordPress',health?.runtime?.wordpress],['WooCommerce',health?.runtime?.woocommerce],['สกุลเงิน',settings?.currency],['ภาษี',settings?(settings.prices_include_tax?'รวมภาษี':'ไม่รวมภาษี'):null],['เขตเวลา',health?.runtime?.timezone]].map(([label,value])=>h('div',{key:label},h('span',null,label),h('strong',null,value||'กำลังอ่าน…')))),h('div',{className:'sdd-schema-state'},h('span',{className:'sdd-status '+(!settings?'neutral':settings.schema_ready?'active':'needs_review')},'ฐานข้อมูล '+(settings?(settings.schema_ready?'พร้อม':'ไม่พร้อม'):'กำลังตรวจ')))),
- h('section',{className:'sdd-setup-card sdd-brand-settings','aria-labelledby':'sdd-brands-heading'},h('div',{className:'sdd-card-heading'},h('h3',{id:'sdd-brands-heading',tabIndex:-1},'แท็กแบรนด์'),h('span',{className:'sdd-term-count'},'เลือก '+selected.size+' / '+terms.length)),h('p',null,'เลือกแท็กที่ใช้เป็นแบรนด์สำหรับค้นหาและกรองสินค้า การเปลี่ยนแปลงนี้ไม่ย้ายหรือลบแท็ก'),h('div',{className:'sdd-term-controls'},h('input',{'aria-label':'ค้นหาแท็กแบรนด์',value:search,onChange:e=>setSearch(e.target.value),placeholder:'พิมพ์ชื่อแบรนด์เพื่อค้นหา…'}),h('button',{type:'button',disabled:busy||!terms.length,'aria-pressed':allVisibleSelected,onClick:()=>{setSelected(prev=>{const next=new Set(prev);visibleTerms.forEach(t=>allVisibleSelected?next.delete(t.id):next.add(t.id));return next;});}},allVisibleSelected?(search?'ยกเลิกผลที่แสดง':'ยกเลิกทั้งหมด'):(search?'เลือกผลที่แสดง':'เลือกทั้งหมด'))),h('div',{className:'sdd-terms'},visibleTerms.map(t=>h('label',{key:t.id},h('input',{type:'checkbox',checked:selected.has(t.id),disabled:busy,onChange:e=>{const next=new Set(selected);e.target.checked?next.add(t.id):next.delete(t.id);setSelected(next);}}),' '+t.name)),!visibleTerms.length&&h('p',{className:'sdd-empty'},termsLoading?'กำลังโหลดแท็กแบรนด์…':termsError?'ยังอ่านแท็กแบรนด์ไม่ได้ · '+termsError:terms.length?'ไม่พบแบรนด์ที่ตรงกับคำค้น':'ยังไม่มีแท็กแบรนด์ในระบบ'))),
- cfg.canManageCache&&h(CacheSettings),h(HealthPanel,{data:health,error:healthError,busy:healthBusy,onRefresh:loadHealth,stopped}),cfg.canLogs&&h(LogViewer),h('div',{className:'sdd-actions'},h('button',{className:'sdd-primary',disabled:busy||settingsLoading||!!settingsError||!settings||!cfg.canManageCache,onClick:save},busy?'กำลังบันทึก…':'บันทึกการตั้งค่าแบรนด์'),h('button',{onClick:onClose,disabled:busy},'กลับตาราง')));
+ h('section',{className:'sdd-setup-card sdd-brand-settings','aria-labelledby':'sdd-brands-heading'},h('div',{className:'sdd-card-heading'},h('h3',{id:'sdd-brands-heading',tabIndex:-1},'แท็กแบรนด์'),h('span',{className:'sdd-term-count'},'เลือก '+selected.size+' / '+terms.length)),h('p',null,'เลือกแท็กที่ใช้เป็นแบรนด์สำหรับค้นหาและกรองสินค้า การเปลี่ยนแปลงนี้ไม่ย้ายหรือลบแท็ก'),!cfg.canManageCache&&h('p',null,'อ่านอย่างเดียว · ติดต่อผู้ดูแลเว็บไซต์เพื่อเปลี่ยนแท็กแบรนด์'),h('div',{className:'sdd-term-controls'},h('input',{'aria-label':'ค้นหาแท็กแบรนด์',value:search,onChange:e=>setSearch(e.target.value),placeholder:'พิมพ์ชื่อแบรนด์เพื่อค้นหา…'}),h('button',{type:'button',disabled:busy||!cfg.canManageCache||!terms.length,'aria-pressed':allVisibleSelected,onClick:()=>{setSelected(prev=>{const next=new Set(prev);visibleTerms.forEach(t=>allVisibleSelected?next.delete(t.id):next.add(t.id));return next;});}},allVisibleSelected?(search?'ยกเลิกผลที่แสดง':'ยกเลิกทั้งหมด'):(search?'เลือกผลที่แสดง':'เลือกทั้งหมด'))),h('div',{className:'sdd-terms'},visibleTerms.map(t=>h('label',{key:t.id},h('input',{type:'checkbox',checked:selected.has(t.id),disabled:busy||!cfg.canManageCache,onChange:e=>{const next=new Set(selected);e.target.checked?next.add(t.id):next.delete(t.id);setSelected(next);}}),' '+t.name)),!visibleTerms.length&&h('p',{className:'sdd-empty'},termsLoading?'กำลังโหลดแท็กแบรนด์…':termsError?'ยังอ่านแท็กแบรนด์ไม่ได้ · '+termsError:terms.length?'ไม่พบแบรนด์ที่ตรงกับคำค้น':'ยังไม่มีแท็กแบรนด์ในระบบ'))),
+ cfg.canManageCache&&h(CacheSettings,{jobId}),h(HealthPanel,{data:health,error:healthError,busy:healthBusy,onRefresh:loadHealth,stopped}),cfg.canLogs&&h(LogViewer),h('div',{className:'sdd-actions'},h('button',{className:'sdd-primary',disabled:busy||settingsLoading||!!settingsError||!settings||!cfg.canManageCache,onClick:save},busy?'กำลังบันทึก…':'บันทึกการตั้งค่าแบรนด์'),h('button',{onClick:onClose,disabled:busy},'กลับตาราง')));
 }
 function downloadLogCsv(data){
  const columns=['เวลา (UTC)','ระดับ','เหตุการณ์','Request ID'];
@@ -469,13 +543,14 @@ function LogViewer(){
  useEffect(()=>{let live=true;setBusy(true);api('logs').then(r=>{if(live){setFiles(r.items||[]);setError('');}}).catch(e=>{if(live)setError(e.message);}).finally(()=>{if(live)setBusy(false);});return()=>{live=false;};},[tick]);
  useEffect(()=>{let live=true;if(!selected){setData(null);return()=>{live=false;};}setBusy(true);api('logs/'+encodeURIComponent(selected)).then(r=>{if(live){setData(r);setError('');}}).catch(e=>{if(live)setError(e.message);}).finally(()=>{if(live)setBusy(false);});return()=>{live=false;};},[selected]);
  const options=files.map(f=>h('option',{key:f.id,value:f.id},displayDate(f.created_at)+' · '+(f.size_bytes<1024?'น้อยกว่า 1 KB':Math.round(f.size_bytes/1024)+' KB')));
- const entries=data&&h('div',{className:'sdd-log-entries'},data.items.map((item,i)=>h('article',{key:item.occurred_at+'-'+i,className:'sdd-log-entry'},h('span',{className:'sdd-status needs_review'},item.level),h('strong',null,item.event),h('time',null,displayDate(item.occurred_at)),item.request_id&&h('code',null,item.request_id))),!data.items.length&&h('p',null,'ไม่มีเหตุการณ์ที่แสดงได้ในไฟล์นี้'),data.truncated&&h('small',null,'ไฟล์มีเหตุการณ์มากกว่าที่หน้าแสดง รายการที่ดาวน์โหลดอาจไม่ครบทั้งไฟล์'));
+ const current=data?.id===selected?data:null;
+ const entries=current&&h('div',{className:'sdd-log-entries'},data.items.map((item,i)=>h('article',{key:item.occurred_at+'-'+i,className:'sdd-log-entry'},h('span',{className:'sdd-status needs_review'},item.level),h('strong',null,item.event),h('time',null,displayDate(item.occurred_at)),item.request_id&&h('code',null,item.request_id))),!data.items.length&&h('p',null,'ไม่มีเหตุการณ์ที่แสดงได้ในไฟล์นี้'),data.truncated&&h('small',null,'ไฟล์มีเหตุการณ์มากกว่าที่หน้าแสดง รายการที่ดาวน์โหลดอาจไม่ครบทั้งไฟล์'));
  return h('section',{className:'sdd-health sdd-log-viewer','aria-label':'บันทึกเหตุการณ์ทางเทคนิค'},
   h('div',{className:'sdd-inspection-heading'},h('h3',null,'บันทึกเหตุการณ์ทางเทคนิค'),h('button',{disabled:busy,onClick:()=>{setSelected('');setData(null);setTick(t=>t+1);}},busy?'กำลังอ่าน…':'โหลดรายการใหม่')),
   h('p',null,'สำหรับผู้ดูแลตรวจปัญหาของ SoundDD · เก็บไฟล์ 30 วัน · แสดงเฉพาะข้อมูลที่จำเป็น ไม่เกิน 200 เหตุการณ์ต่อไฟล์'),
   error&&h('p',{role:'alert',className:'sdd-error'},error),
   h('label',null,'ไฟล์ log ',h('select',{value:selected,onChange:e=>setSelected(e.target.value)},h('option',{value:''},files.length?'เลือกไฟล์':'ไม่พบไฟล์ log'),options)),
-  data&&h('div',{className:'sdd-log-download-row'},h('button',{type:'button',className:'sdd-secondary',disabled:busy||!data.items.length,onClick:()=>downloadLogCsv(data)},'ดาวน์โหลด CSV'),h('span',null,data.truncated?'ดาวน์โหลดเฉพาะรายการที่แสดง':'ดาวน์โหลดเหตุการณ์ที่ผ่านการกรองทั้งหมดในไฟล์นี้')),
+  current&&h('div',{className:'sdd-log-download-row'},h('button',{type:'button',className:'sdd-secondary',disabled:busy||!data.items.length,onClick:()=>downloadLogCsv(data)},'ดาวน์โหลด CSV'),h('span',null,data.truncated?'ดาวน์โหลดเฉพาะรายการที่แสดง':'ดาวน์โหลดเหตุการณ์ที่ผ่านการกรองทั้งหมดในไฟล์นี้')),
   entries);
 }
 const promoLabels={pending:'รอเริ่ม',active:'กำลังใช้',needs_review:'ต้องตรวจสอบ',restored:'คืนราคาแล้ว',cancelled:'ปิดรายการแล้ว',missed:'เลยเวลาเริ่ม'};
@@ -484,13 +559,13 @@ function HealthPanel({data,error,busy,onRefresh,stopped}){
  const cronNames={sdd_feed_publish:'เผยแพร่การเปลี่ยนแปลง',sdd_external_drain:'ประมวลผลการแก้จากภายนอก',sdd_temporary_sale_scan:'ตรวจเวลาโปรชั่วคราว',sdd_log_retention:'ลบไฟล์ log ที่เกิน 30 วัน',sdd_business_retention:'ลบประวัติและรายการดำเนินการที่จบแล้วเกิน 90 วัน'};
  return h('section',{className:'sdd-health','aria-label':'สถานะระบบ'},h('div',{className:'sdd-inspection-heading'},h('div',null,h('h3',null,'รายละเอียดการตรวจระบบ'),data?.server_time&&h('small',{className:'sdd-health-checked'},'ตรวจล่าสุด '+displayDate(data.server_time))),h('button',{disabled:busy,onClick:onRefresh},busy?'กำลังตรวจ…':'ตรวจอีกครั้ง')),busy&&!data&&h('p',{role:'status'},'กำลังอ่านสถานะระบบ…'),error&&h('p',{role:'alert',className:'sdd-error'},error),data&&h(wp.element.Fragment,null,h('div',{className:'sdd-health-grid'},(data.checks||[]).map(c=>{const statusLabel=c.key==='writer'&&stopped&&!(data.enable_reasons||[]).length?'ปิดตามการตั้งค่า':({ok:'พร้อม',blocked:'ต้องแก้ก่อนเปิด',warning:'ควรตรวจสอบ'})[c.state];return h('div',{key:c.key,className:'sdd-health-check '+c.state},h('div',{className:'sdd-health-check-heading'},h('strong',null,c.label),h('span',{className:'sdd-status '+(c.state==='ok'?'active':c.state==='blocked'?'needs_review':'expired')},statusLabel)),h('p',null,c.detail));})),h('h4',null,'งานที่รอดำเนินการ'),h('div',{className:'sdd-health-queues'},Object.entries(data.queues||{}).map(([key,q])=>h('p',{key},queueNames[key]||key,': ',h('strong',null,q.count===null?'อ่านไม่ได้':q.count+(q.at_least?'+':''))))),h('small',null,'แสดงไม่เกิน 100 รายการต่อคิว; 100+ คืออย่างน้อย 101 รายการ'),h('h4',null,'งานอัตโนมัติ'),h('ul',null,(data.cron||[]).map(c=>h('li',{key:c.job},cronNames[c.job]||c.job,': ',c.next_at?displayDate(c.next_at):'ยังไม่มีนัดหมาย',c.state==='warning'?' · ยังไม่พร้อม':c.state==='idle'?' · ยังไม่จำเป็นตอนนี้':' · มีนัดหมาย'))),h('p',{className:'sdd-plan-help'},data.cron_note,data.wp_cron_disabled?' · ปิด WP-Cron อยู่ ให้ผู้ดูแลตรวจระบบเรียกงานของเซิร์ฟเวอร์':''),h('p',{className:'sdd-warning'},'ข้อมูลนี้แสดงความพร้อมที่ปลั๊กอินตรวจได้ ตารางงานที่มีนัดหมายยังไม่ยืนยันว่ารันสำเร็จ และไม่ได้ตรวจการกู้คืน backup')));
 }
-function AuditPanel({productId,onClose}){
- const [input,setInput]=useState(productId||''),[id,setId]=useState(productId||''),[field,setField]=useState(''),[cursors,setCursors]=useState(['']),[tick,setTick]=useState(0),[data,setData]=useState(null),[busy,setBusy]=useState(false),[error,setError]=useState('');
+function AuditPanel({productId,onClose,onRollback,initialField='',eventId}){
+ const [input,setInput]=useState(productId||''),[id,setId]=useState(productId||''),[field,setField]=useState(initialField),[cursors,setCursors]=useState(()=>[eventId?String(BigInt(eventId)+1n):'']),[tick,setTick]=useState(0),[data,setData]=useState(null),[busy,setBusy]=useState(false),[error,setError]=useState('');
  const before=cursors[cursors.length-1];
  useEffect(()=>{let live=true;if(!id)return;setBusy(true);setData(null);setError('');api('audit?'+new URLSearchParams({product_id:id,field,before,per_page:'20'})).then(r=>{if(live)setData(r);}).catch(e=>{if(live)setError(e.message);}).finally(()=>{if(live)setBusy(false);});return()=>{live=false;};},[id,field,before,tick]);
  function search(){if(!/^[1-9][0-9]{0,17}$/.test(input.trim())){setData(null);setError('กรอกรหัสสินค้า หรือรหัสตัวเลือกสินค้า เป็นตัวเลขเท่านั้น');return;}setId(input.trim());setCursors(['']);setTick(t=>t+1);setError('');}
- const sources={inline_edit:'แก้รายสินค้า',bulk_action:'แก้หลายรายการ',rollback:'ย้อนคืน',external_hook:'ช่องทางภายนอก',external_detected:'ตรวจพบค่าภายนอก',woo_schedule:'ตารางโปร WooCommerce',temporary_sale:'โปรชั่วคราว',temporary_start:'เริ่มโปรชั่วคราว',temporary_restore:'คืนโปรชั่วคราว',sale_plan:'ตั้งโปร'};
- const rows=data&&data.items.map(e=>{const login=e.actor_login||(e.user_id?'บัญชี #'+e.user_id:'ระบบ / ช่องทางภายนอก');return h('tr',{key:e.id},h('td',null,displayDate(e.created_at),h('small',null,'Event #'+e.id)),h('td',null,labels[e.field]||e.field,h('small',null,sources[e.source]||e.source)),h('td',null,h('strong',null,showValue(e.old_value,e.field)+' → '+showValue(e.new_value,e.field)),h('small',null,'Revision '+e.revision_before+' → '+e.revision_after)),h('td',{className:'sdd-audit-actor'},h('strong',null,login),e.actor_email&&h('small',null,e.actor_email),e.user_id&&!e.actor_login&&h('small',null,'ไม่พบข้อมูลบัญชีผู้ใช้'),h('details',null,h('summary',null,'รหัสสำหรับตรวจสอบ'),h('small',null,'Request: '+e.request_id),e.operation_id&&h('small',null,'Operation: '+e.operation_id),e.reverts_event_id&&h('small',null,'ย้อน Event #'+e.reverts_event_id))));});
+ const sources={inline:'แก้รายสินค้า',temporary_sale_created:'ตั้งโปรล่วงหน้า',inline_edit:'แก้รายสินค้า',bulk_action:'แก้หลายรายการ',rollback:'ย้อนคืน',external_hook:'ช่องทางภายนอก',external_detected:'ตรวจพบค่าภายนอก',woo_schedule:'ตารางโปร WooCommerce',temporary_sale:'โปรชั่วคราว',temporary_start:'เริ่มโปรชั่วคราว',temporary_restore:'คืนโปรชั่วคราว',temporary_reprice:'แก้ราคาโปรชั่วคราว',sale_plan:'ตั้งโปร'};
+ const rows=data&&data.items.map(e=>{const login=e.actor_login||(e.user_id?'บัญชี #'+e.user_id:'ระบบ / ช่องทางภายนอก');return h('tr',{key:e.id,'aria-current':String(e.id)===eventId?'true':undefined},h('td',null,String(e.id)===eventId&&h('strong',null,'เหตุการณ์ที่เลือก'),displayDate(e.created_at),h('small',null,'Event #'+e.id)),h('td',null,labels[e.field]||(e.field==='temporary_sale'?'แผนโปรชั่วคราว':e.field),h('small',null,sources[e.source]||e.source)),h('td',null,h('strong',null,e.source==='temporary_sale_created'?'บันทึกแผนแล้ว · รอเวลาเริ่ม':showValue(e.old_value,e.field)+' → '+showValue(e.new_value,e.field)),h('small',null,'Revision '+e.revision_before+' → '+e.revision_after)),h('td',{className:'sdd-audit-actor'},h('strong',null,login),e.actor_email&&h('small',null,e.actor_email),e.user_id&&!e.actor_login&&h('small',null,'ไม่พบข้อมูลบัญชีผู้ใช้'),h('details',null,h('summary',null,'รหัสสำหรับตรวจสอบ'),h('small',null,'Request: '+e.request_id),e.operation_id&&h('small',null,'Operation: '+e.operation_id),e.reverts_event_id&&h('small',null,'ย้อน Event #'+e.reverts_event_id)),cfg.canRollback&&onRollback&&['regular_price','sale_price'].includes(e.field)&&h('button',{type:'button',onClick:()=>onRollback(String(e.id))},'ตรวจสอบก่อนย้อนราคา')));});
  return h('section',{className:'sdd-audit','aria-label':'ประวัติการแก้ไข'},
   h('div',{className:'sdd-inspection-heading'},h('h2',null,'ประวัติการแก้ไข'),h('button',{onClick:onClose},'กลับตาราง')),
   h('p',null,'กรอกรหัสสินค้าเพื่อดูการแก้ไขที่ผ่านมา รวมการแก้จากช่องทางอื่นที่ระบบตรวจพบ แสดงเฉพาะสินค้าที่คุณมีสิทธิ์ดู'),
@@ -523,93 +598,162 @@ function originalScheduleState(dates,now){
 }
 function isoDateParts(value){const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(value||'');return m?{year:Number(m[1]),month:Number(m[2]),day:Number(m[3])}:null;}
 function isoDate(year,month,day){return year+'-'+String(month).padStart(2,'0')+'-'+String(day).padStart(2,'0');}
-function DateTimePicker({value,onChange,label,disabled,id,defaultTime='00:00'}){
- const [open,setOpen]=useState(false),[month,setMonth]=useState(()=>{const p=isoDateParts(value);const now=new Date();return {year:p?.year||now.getFullYear(),month:p?.month||now.getMonth()+1};}),[position,setPosition]=useState(null);
+function DateTimePicker({value,onChange,label,disabled,id,invalid,describedBy,defaultTime='00:00'}){
+ const todayISO=localMinute(Date.now()/1000).slice(0,10),today=isoDateParts(todayISO);
+ const selected=isoDateParts(value),time=value?.slice(11,16)||defaultTime;
+ const monthOf=({year,month})=>({year,month});
+ const [open,setOpen]=useState(false),[month,setMonth]=useState(()=>monthOf(selected||today)),[position,setPosition]=useState(null);
+ const [focusDay,setFocusDay]=useState('');
  const root=useRef(null),trigger=useRef(null),grid=useRef(null),popover=useRef(null);
- const selected=isoDateParts(value),time=value?.slice(11,16)||defaultTime,today=new Date(),todayISO=isoDate(today.getFullYear(),today.getMonth()+1,today.getDate());
+ useEffect(()=>{if(open)grid.current?.querySelector('button[tabindex="0"]')?.focus();},[open]);
  useEffect(()=>{if(!open)return;const outside=e=>{if(!root.current?.contains(e.target))setOpen(false);},escape=e=>{if(e.key==='Escape'){e.preventDefault();setOpen(false);trigger.current?.focus();}};document.addEventListener('pointerdown',outside);document.addEventListener('keydown',escape);return()=>{document.removeEventListener('pointerdown',outside);document.removeEventListener('keydown',escape);};},[open]);
  useEffect(()=>{if(!open)return;const place=()=>{const a=trigger.current?.getBoundingClientRect(),p=popover.current?.getBoundingClientRect();if(!a||!p)return;setPosition({left:Math.max(12,Math.min(a.left,window.innerWidth-p.width-12)),top:a.bottom+p.height+12>window.innerHeight?Math.max(12,a.top-p.height-8):a.bottom+8});};const raf=requestAnimationFrame(place);window.addEventListener('resize',place);window.addEventListener('scroll',place,true);return()=>{cancelAnimationFrame(raf);window.removeEventListener('resize',place);window.removeEventListener('scroll',place,true);};},[open,month]);
  const dateLabel=selected?new Intl.DateTimeFormat('th-TH',{day:'numeric',month:'short',year:'numeric',timeZone:'UTC'}).format(new Date(Date.UTC(selected.year,selected.month-1,selected.day))):'เลือกวันที่';
  const monthLabel=new Intl.DateTimeFormat('th-TH',{month:'long',year:'numeric',timeZone:'UTC'}).format(new Date(Date.UTC(month.year,month.month-1,1)));
  const firstWeekday=new Date(Date.UTC(month.year,month.month-1,1)).getUTCDay(),daysInMonth=new Date(Date.UTC(month.year,month.month,0)).getUTCDate();
- const moveMonth=delta=>{const d=new Date(Date.UTC(month.year,month.month-1+delta,1));setMonth({year:d.getUTCFullYear(),month:d.getUTCMonth()+1});};
+ const moveMonth=delta=>{const d=new Date(Date.UTC(month.year,month.month-1+delta,1));setFocusDay(isoDate(d.getUTCFullYear(),d.getUTCMonth()+1,1));setMonth({year:d.getUTCFullYear(),month:d.getUTCMonth()+1});};
  const chooseDate=date=>onChange(date+'T'+time);
  const setTime=next=>{const date=selected?isoDate(selected.year,selected.month,selected.day):todayISO;onChange(date+'T'+next);};
  const cells=Array.from({length:42},(_,i)=>{const day=i-firstWeekday+1,date=new Date(Date.UTC(month.year,month.month-1,day)),dateISO=isoDate(date.getUTCFullYear(),date.getUTCMonth()+1,date.getUTCDate()),inMonth=day>0&&day<=daysInMonth;return {date,dateISO,inMonth,day:date.getUTCDate()};});
  const keyMove=(event,index)=>{const delta={ArrowLeft:-1,ArrowRight:1,ArrowUp:-7,ArrowDown:7}[event.key];if(delta===undefined)return;event.preventDefault();grid.current?.querySelectorAll('button[data-day]')[Math.max(0,Math.min(41,index+delta))]?.focus();};
- return h('div',{className:'sdd-datetime-picker',ref:root},h('button',{type:'button',ref:trigger,id, className:'sdd-datetime-trigger','aria-label':label+': '+(selected?dateLabel+' เวลา '+time:'ยังไม่ได้เลือกวันและเวลา'),'aria-haspopup':'dialog','aria-expanded':open,disabled,onClick:()=>{if(!open){const p=isoDateParts(value);if(p)setMonth({year:p.year,month:p.month});}setOpen(v=>!v);}},h('span',{className:'sdd-datetime-trigger-value'},selected?h( wp.element.Fragment,null,h('strong',null,dateLabel),h('span',null,time)):h('span',{className:'sdd-datetime-placeholder'},'เลือกวันและเวลา')),h('span',{className:'sdd-calendar-icon','aria-hidden':'true'},h('svg',{viewBox:'0 0 24 24',focusable:'false'},h('rect',{x:'3.5',y:'5',width:'17',height:'15',rx:'2',fill:'none',stroke:'currentColor',strokeWidth:'1.8'}),h('path',{d:'M7.5 3.5v3M16.5 3.5v3M4 9h16',fill:'none',stroke:'currentColor',strokeWidth:'1.8',strokeLinecap:'round'}),h('path',{d:'M8 12.5h2v2H8zM12 12.5h2v2h-2zM16 12.5h1v2h-1z',fill:'currentColor'})))),
+ return h('div',{className:'sdd-datetime-picker',ref:root},h('button',{type:'button',ref:trigger,id, className:'sdd-datetime-trigger','aria-label':label+': '+(selected?dateLabel+' เวลา '+time:'ยังไม่ได้เลือกวันและเวลา'),'aria-haspopup':'dialog','aria-expanded':open,'aria-invalid':invalid||undefined,'aria-describedby':describedBy,disabled,onClick:()=>{if(!open){setMonth(monthOf(selected||today));setFocusDay(selected?value.slice(0,10):todayISO);}setOpen(v=>!v);}},h('span',{className:'sdd-datetime-trigger-value'},selected?h( wp.element.Fragment,null,h('strong',null,dateLabel),h('span',null,time)):h('span',{className:'sdd-datetime-placeholder'},'เลือกวันและเวลา')),h('span',{className:'sdd-calendar-icon','aria-hidden':'true'},h('svg',{viewBox:'0 0 24 24',focusable:'false'},h('rect',{x:'3.5',y:'5',width:'17',height:'15',rx:'2',fill:'none',stroke:'currentColor',strokeWidth:'1.8'}),h('path',{d:'M7.5 3.5v3M16.5 3.5v3M4 9h16',fill:'none',stroke:'currentColor',strokeWidth:'1.8',strokeLinecap:'round'}),h('path',{d:'M8 12.5h2v2H8zM12 12.5h2v2h-2zM16 12.5h1v2h-1z',fill:'currentColor'})))),
  open&&h('div',{className:'sdd-calendar-popover',ref:popover,style:position?{left:position.left,top:position.top}:undefined,role:'dialog','aria-label':label+' เลือกวันและเวลา'},h('div',{className:'sdd-calendar-head'},h('button',{type:'button','aria-label':'เดือนก่อนหน้า',onClick:()=>moveMonth(-1)},'‹'),h('strong',null,monthLabel),h('button',{type:'button','aria-label':'เดือนถัดไป',onClick:()=>moveMonth(1)},'›')),
  h('div',{className:'sdd-calendar-grid'},['อา','จ','อ','พ','พฤ','ศ','ส'].map((day,i)=>h('span',{key:day+i,className:'sdd-calendar-weekday','aria-hidden':'true'},day))),
- h('div',{className:'sdd-calendar-grid sdd-calendar-days',ref:grid},cells.map((cell,i)=>h('button',{key:cell.dateISO,type:'button','data-day':cell.dateISO,tabIndex:i===cells.findIndex(c=>c.dateISO===(selected?isoDate(selected.year,selected.month,selected.day):todayISO))?0:-1,className:[cell.inMonth?'':'outside',cell.dateISO===todayISO?'today':'',selected&&cell.dateISO===isoDate(selected.year,selected.month,selected.day)?'selected':''].filter(Boolean).join(' '),'aria-label':new Intl.DateTimeFormat('th-TH',{dateStyle:'full',timeZone:'UTC'}).format(cell.date),'aria-pressed':!!selected&&cell.dateISO===isoDate(selected.year,selected.month,selected.day),onKeyDown:e=>keyMove(e,i),onClick:()=>chooseDate(cell.dateISO)},cell.day))),
- h('div',{className:'sdd-calendar-footer'},h('button',{type:'button',className:'sdd-calendar-today',onClick:()=>{chooseDate(todayISO);setMonth({year:today.getFullYear(),month:today.getMonth()+1});}},'วันนี้'),h('label',null,'เวลา',h('input',{type:'time',step:60,value:time,'aria-label':label+' เวลา',onChange:e=>setTime(e.target.value)}))),
+ h('div',{className:'sdd-calendar-grid sdd-calendar-days',ref:grid},cells.map((cell,i)=>h('button',{key:cell.dateISO,type:'button','data-day':cell.dateISO,tabIndex:cell.dateISO===focusDay?0:-1,onFocus:()=>setFocusDay(cell.dateISO),className:[cell.inMonth?'':'outside',cell.dateISO===todayISO?'today':'',selected&&cell.dateISO===isoDate(selected.year,selected.month,selected.day)?'selected':''].filter(Boolean).join(' '),'aria-label':new Intl.DateTimeFormat('th-TH',{dateStyle:'full',timeZone:'UTC'}).format(cell.date),'aria-pressed':!!selected&&cell.dateISO===isoDate(selected.year,selected.month,selected.day),onKeyDown:e=>keyMove(e,i),onClick:()=>chooseDate(cell.dateISO)},cell.day))),
+ h('div',{className:'sdd-calendar-footer'},h('button',{type:'button',className:'sdd-calendar-today',onClick:()=>{chooseDate(todayISO);setMonth(monthOf(today));setFocusDay(todayISO);}},'วันนี้'),h('label',null,'เวลา',h('input',{type:'time',step:60,value:time,'aria-label':label+' เวลา',onChange:e=>setTime(e.target.value)}))),
  h('div',{className:'sdd-calendar-actions'},h('button',{type:'button',onClick:()=>{onChange('');setOpen(false);trigger.current?.focus();}},'ล้างวันที่'),h('button',{type:'button',className:'sdd-calendar-done',onClick:()=>{setOpen(false);trigger.current?.focus();}},'เสร็จสิ้น'))));
 }
 function restorationSummary(plan,now=Date.now()/1000){
  const after=plan.revive_expired?plan.original.sale_price:restoredPrice(plan.original,localMinute(plan.ends_at));
  if(plan.status==='restored')return {tone:'success',title:'คืนราคาและตารางเดิมแล้ว',detail:'ระบบบันทึกการคืนราคาสำเร็จแล้ว',after};
- if(plan.status==='needs_review')return {tone:'attention',title:'ต้องตรวจราคาก่อนคืนอัตโนมัติ',detail:'พบข้อมูลเปลี่ยนหรือมีปัญหา ระบบจึงคงราคาปัจจุบันไว้ ให้ตรวจประวัติราคาแล้วตัดสินใจต่อ',after};
+ if(plan.status==='needs_review')return {tone:'attention',title:'โปรหยุดรอตรวจสอบ',detail:'ตรวจผลคำสั่งเพื่อดูว่าโปรเริ่มใช้หรือคืนราคาแล้วหรือยัง',after};
  if(plan.status==='cancelled')return {tone:'neutral',title:'ปิดรายการแล้ว',detail:'ดูผลการปิดรายการและราคาปัจจุบันด้านล่าง',after};
  if(plan.status==='missed')return {tone:'attention',title:'โปรนี้ไม่ได้เริ่มตามกำหนด',detail:'ตรวจราคาปัจจุบันและประวัติก่อนทำรายการต่อ',after};
  if(plan.status==='pending'&&Number(plan.starts_at)<now-300)return {tone:'attention',title:'เลยเวลาเริ่มแล้ว ยังไม่ยืนยันการเริ่มโปร',detail:'ตรวจงานอัตโนมัติหรือแจ้งผู้ดูแลก่อนทำรายการซ้ำ',after};
  if(plan.status==='active'&&Number(plan.ends_at)<now-300)return {tone:'attention',title:'เลยเวลาคืนราคาแล้ว กำลังรอตรวจสอบ',detail:'ยังไม่ยืนยันการคืนราคา ตรวจงานอัตโนมัติหรือแจ้งผู้ดูแล',after};
  return {tone:'scheduled',title:'ตั้งให้กลับเป็น '+showValue(after,'sale_price')+' บาทหลังจบ',detail:'กำหนดคืนราคา '+promoTime(plan.ends_at)+' · ดูผลการคืนราคาได้ที่นี่',after};
 }
-function RestorationCard({plan,currentPrice,automation}){
+function RestorationCard({plan,currentPrice,automation,onAudit,onCloseReview,onCheck,check,onRestart}){
  const result=restorationSummary(plan);
  const paused=automation?.blocked&&['pending','active'].includes(plan.status);
- return h('section',{className:'sdd-restoration-card '+(paused?'attention':result.tone),'aria-label':'การคืนราคาหลังจบโปร'},h('span',{className:'sdd-restoration-icon','aria-hidden':true},result.tone==='success'?'✓':paused||result.tone==='attention'?'!':'↩'),h('div',null,h('strong',null,paused?'งานราคาอัตโนมัติหยุดอยู่':result.title),h('p',null,paused?'ต้องให้ผู้ดูแลเปิดการทำงานอีกครั้ง เพื่อให้ระบบเริ่มและคืนราคาโปรได้':result.detail),plan.status==='restored'&&plan.updated_at&&h('p',null,'บันทึกผลเมื่อ '+promoTime(String(Date.parse(plan.updated_at)/1000))),h('div',{className:'sdd-restoration-prices'},h('span',null,'หลังจบตามแผน ',h('b',null,showValue(result.after,'sale_price')+' บาท')),typeof currentPrice==='string'&&h('span',null,'ราคาข้อมูลล่าสุด ',h('b',null,showValue(currentPrice,'sale_price')+' บาท'))),h('details',null,h('summary',null,'ระบบคืนราคาอย่างไร'),h('p',null,'ระบบเก็บราคาและตารางเดิมไว้ และจะพยายามคืนให้เมื่อครบเวลา โดยไม่ต้องตั้งโปรเดิมใหม่ หากมีการแก้ราคาแทรก ระบบจะหยุดไว้ให้ตรวจสอบเพื่อไม่ทับค่าที่แก้ใหม่ งานอัตโนมัติของเว็บอาจทำให้คืนราคาช้ากว่ากำหนด'))));
+ const review=plan.status==='needs_review';
+ const matchesPlan=review&&typeof currentPrice==='string'&&currentPrice!==''&&currentPrice===result.after;
+ const operationLabels={succeeded:'พบผลบันทึกว่าสำเร็จ',failed:'พบผลบันทึกว่าไม่สำเร็จ',unknown:'พบคำสั่ง แต่ยังยืนยันผลไม่ได้',no_record:'ไม่พบผลคำสั่งที่บันทึกไว้'};
+ const after=h('span',null,review?'ราคาหลังจบตามแผนเดิม ':'หลังจบตามแผน ',h('b',null,showValue(result.after,'sale_price')+' บาท'));
+ const current=(review||typeof currentPrice==='string')&&h('span',null,review?'ราคาในระบบล่าสุด ':'ราคาข้อมูลล่าสุด ',h('b',null,currentPrice?showValue(currentPrice,'sale_price')+' บาท':review?'ยังไม่มีข้อมูลราคา':'— บาท'));
+ return h('section',{className:'sdd-restoration-card '+(paused?'attention':result.tone),'aria-label':'การคืนราคาหลังจบโปร'},
+  h('span',{className:'sdd-restoration-icon','aria-hidden':'true'},result.tone==='success'?'✓':paused||result.tone==='attention'?'!':'↩'),
+  h('div',null,h('strong',null,paused?'งานราคาอัตโนมัติหยุดอยู่':result.title),
+   h('p',null,paused?(automation.reason||'ต้องให้ผู้ดูแลเปิดการทำงานอีกครั้ง เพื่อให้ระบบเริ่มและคืนราคาโปรได้'):result.detail),
+   plan.status==='restored'&&plan.updated_at&&h('p',null,'บันทึกผลเมื่อ '+promoTime(String(Date.parse(plan.updated_at)/1000))),
+   review&&plan.message&&h('p',null,'เหตุผลที่หยุด · '+plan.message),
+   h('div',{className:'sdd-restoration-prices'},review?current:after,review?after:current),
+   review?h(wp.element.Fragment,null,
+    matchesPlan&&h('p',null,'ราคาในระบบตรงกับแผนเดิม แต่ยังต้องตรวจผลคำสั่ง'),
+    onCheck&&h('button',{type:'button',className:'sdd-primary',disabled:!!check?.busy,onClick:onCheck},check?.busy?'กำลังตรวจผล…':check?.result?'ตรวจผลอีกครั้ง':'ตรวจผลคำสั่งโปร'),
+    check?.error&&h('p',{role:'alert'},check.error),
+    check?.result&&h('div',{role:'status'},
+     h('ul',{className:'sdd-restoration-steps'},[['start','เริ่มโปร'],['end','คืนราคาหลังจบ']].map(([phase,label])=>h('li',{key:phase},h('b',null,label+' · '),operationLabels[check.result[phase]?.status]||operationLabels.unknown))),
+     h('p',null,check.result.end?.status==='succeeded'?'พบหลักฐานว่าการคืนราคาบันทึกสำเร็จแล้ว หากราคาและวันโปรปัจจุบันถูกต้อง ให้ปิดงานได้':'ถ้ายังยืนยันผลไม่ได้ ให้เปิดประวัติราคาแล้วตรวจราคาและวันโปรก่อนตัดสินใจ'),
+     h('details',null,h('summary',null,'รหัสคำสั่งสำหรับส่งให้ผู้ดูแล'),[['start','เริ่มโปร'],['end','คืนราคาหลังจบ']].map(([phase,label])=>check.result[phase]?.operation_id&&h('p',{key:phase},label+' ',h('code',null,check.result[phase].operation_id))))),
+    !onAudit&&h('p',null,'ให้ผู้ดูแลที่มีสิทธิ์เปิดประวัติราคาตรวจสอบก่อนเลือกว่าจะใช้ราคาไหนต่อ'),
+    h('details',null,h('summary',null,'เลือกว่าจะทำอะไรต่อ'),h('ul',{className:'sdd-restoration-steps'},
+     h('li',null,h('b',null,'ราคาปัจจุบันถูกต้องแล้ว '),'กดปิดงานเพื่อเก็บราคานี้ไว้'),
+     h('li',null,h('b',null,'ราคาปัจจุบันต้องแก้ '),'ตรวจราคาและวันโปรที่ถูกต้องก่อน แล้วปิดงานและแก้สินค้าเอง'),
+     h('li',null,h('b',null,'ยังไม่แน่ใจหรือผลคำสั่งไม่ชัด '),'เปิดงานนี้ไว้แล้วส่งให้ผู้ดูแลตรวจผลเดิมก่อนแก้ราคา'))),
+    h('p',null,'การปิดงานจะคงราคากับวันโปรที่ใช้อยู่'),
+    h('div',{className:'sdd-plan-actions'},
+     onRestart&&h('button',{type:'button',className:'sdd-primary',onClick:onRestart},'เตรียมโปรใหม่ '+showValue(plan.price,'sale_price')+' บาท'),
+     onAudit&&h('button',{type:'button',onClick:onAudit},'เปิดประวัติราคา'),
+     onCloseReview&&h('button',{type:'button',onClick:onCloseReview},'ปิดงานและคงราคาปัจจุบัน')))
+   :h('details',null,h('summary',null,'ระบบคืนราคาอย่างไร'),h('p',null,'ระบบเก็บราคาและตารางเดิมไว้ และจะพยายามคืนให้เมื่อครบเวลา โดยไม่ต้องตั้งโปรเดิมใหม่ หากมีการแก้ราคาแทรก ระบบจะหยุดไว้ให้ตรวจสอบเพื่อไม่ทับค่าที่แก้ใหม่ งานอัตโนมัติของเว็บอาจทำให้คืนราคาช้ากว่ากำหนด'))));
 }
-function TemporarySale({row,onSaved}){
+function promotionDraftError(draft,regular,now){
+ if(!/^(0|[1-9][0-9]{0,14})$/.test(draft.price))return ['price','กรอกราคาโปรเป็นจำนวนเต็ม'];
+ if(/^[0-9]+$/.test(regular)&&BigInt(draft.price)>=BigInt(regular))return ['price','ราคาโปรต้องต่ำกว่าราคาปกติ '+showValue(regular,'regular_price')+' บาท'];
+ if(!draft.start)return ['start','เลือกวันและเวลาเริ่มโปร'];
+ if(!draft.end)return ['end','เลือกวันและเวลาสิ้นสุดโปร'];
+ if(draft.end<=draft.start)return ['end','เวลาสิ้นสุดต้องอยู่หลังเวลาเริ่ม'];
+ if(draft.end<=now)return ['end','เวลาโปรสิ้นสุดแล้ว เลือกเวลาสิ้นสุดใหม่'];
+ return null;
+}
+function TemporarySale({row,onSaved,canWrite,onAudit}){
  const [data,setData]=useState(null),[working,setBusy]=useState(false),[error,setError]=useState(''),[readError,setReadError]=useState(false),[,render]=useState(0);
  const readGeneration=useRef(0),activeReads=useRef(0);
- const key=row.id,priceReadonly=!row.editable.sale_price; let d=promoDrafts.get(key);
+ const [operationCheck,setOperationCheck]=useState(null);
+ const [fieldError,setFieldError]=useState(null);
+ const newStart=useRef(null);
+ const key=row.id,priceReadonly=row.type==='bundle'?data?.can_edit_price!==true:!row.editable.sale_price; let d=promoDrafts.get(key);
  if(!d){d={price:'',start:'',end:'',revive:false,operation:null,state:'clean'};promoDrafts.set(key,d);}
  const busy=working||d.state==='saving';
  const livePlan=data?.items?.find(p=>['pending','active','needs_review'].includes(p.status));
+ useEffect(()=>{if(!livePlan&&!busy&&d.prepared){newStart.current?.querySelector('button:not(:disabled)')?.focus();}},[!!livePlan,busy,d.prepared]);
  const originalDates=livePlan?.original?.sale_dates??data?.baseline?.sale_dates??row.sale_dates??'|';
  const originalState=originalScheduleState(originalDates,Number(data?.server_time||Date.now()/1000));
- const change=(field,value)=>{d[field]=value;d.state='dirty';render(x=>x+1);signalDraft(row.id);};
+ const change=(field,value)=>{d[field]=value;d.state='dirty';setFieldError(null);render(x=>x+1);signalDraft(row.id);};
  useEffect(()=>{load();const refresh=()=>{if(!document.hidden&&d.state!=='saving')load(true);};const timer=setInterval(refresh,30000);document.addEventListener('visibilitychange',refresh);return()=>{readGeneration.current++;clearInterval(timer);document.removeEventListener('visibilitychange',refresh);};},[row.id,row.temporary_sale?.status,row.regular_price,row.sale_price,row.sale_dates]);
  useEffect(()=>{const changed=e=>{if(e.detail===row.id)render(x=>x+1);};window.addEventListener('sdd:draft-update',changed);return()=>window.removeEventListener('sdd:draft-update',changed);},[row.id]);
  const load=async(background=false)=>{if(background&&activeReads.current)return false;activeReads.current++;const generation=++readGeneration.current;if(!background)setBusy(true);setReadError(false);try{const latest=await api('products/'+row.id+'/temporary-sales');if(generation!==readGeneration.current)return false;setData(latest);setError('');return true;}catch(e){if(generation===readGeneration.current){setReadError(true);setError('ตรวจข้อมูลล่าสุดไม่สำเร็จ · '+e.message);}return false;}finally{activeReads.current--;if(!background&&generation===readGeneration.current)setBusy(false);}};
- const done=async()=>{markCachePending(row.id);d.state='clean';d.operation=null;d.price='';d.start='';d.end='';d.revive=false;signalDraft(row.id);await load();onSaved(row.id,'sale_price',row.sale_price,row.revisions.sale_price);};
+ const done=async()=>{d.state='clean';d.operation=null;d.price='';d.start='';d.end='';d.revive=false;d.prepared=false;signalDraft(row.id);await load();onSaved(row.id,'sale_price',row.sale_price,row.revisions.sale_price);};
  async function save(){
-  if(!data?.baseline||busy||readError||d.state==='unknown')return;
-  if(!/^(0|[1-9][0-9]{0,14})$/.test(d.price)||!d.start||!d.end||d.end<=d.start){setError('กรอกราคาเป็นจำนวนเต็ม พร้อมวันเริ่มและวันสิ้นสุด โดยวันสิ้นสุดต้องหลังวันเริ่ม');return;}
-  const now=localMinute(Date.now()/1000),reference=referenceAt(data.baseline,d.start>now?d.start:now);
-  if(BigInt(d.price)>=BigInt(reference.price)){setError('ราคาโปรชั่วคราวต้องต่ำกว่าราคาปกติ '+showValue(reference.price,'regular_price'));return;}
+  if((canWrite&&!canWrite())||!data?.baseline||data.automation?.reason||busy||readError||d.state==='unknown')return;
+  const now=localMinute(Date.now()/1000),validation=promotionDraftError(d,data.baseline.regular_price,now);
+  setFieldError(validation);
+  if(validation){requestAnimationFrame(()=>document.getElementById('sdd-promo-'+row.id+'-'+validation[0])?.focus());return;}
   if([...drafts.entries()].some(([k,v])=>k.startsWith(row.id+':')&&v.state!=='clean')){setError('บันทึกหรือยกเลิกราคาที่แก้ค้างไว้ของสินค้านี้ ก่อนตั้งโปรชั่วคราว');return;}
   const after=d.revive&&canRevive(data.baseline,d.end)?data.baseline.sale_price:restoredPrice(data.baseline,d.end);
-  const summary=row.name+'\nราคาโปร '+showValue(d.price,'sale_price')+' บาท\nเริ่ม '+displayDate(d.start)+' · จบ '+displayDate(d.end)+' ('+(cfg.timezone||'UTC')+')\nหลังจบตามแผน '+showValue(after,'sale_price')+' บาท\nระบบเก็บราคาและตารางเดิมไว้เพื่อคืนอัตโนมัติ ดูผลการคืนได้ในรายการโปรนี้'+(d.revive&&canRevive(data.baseline,d.end)?'\nคุณเลือกใช้ราคาโปรเดิมต่อแม้หมดอายุ โดยล้างวันเริ่ม–จบเดิม':'');
+  const summary=row.name+(row.type==='bundle'?'\nราคาโปรฐานของชุด ':'\nราคาโปร ')+showValue(d.price,'sale_price')+' บาท\nเริ่ม '+displayDate(d.start)+' · จบ '+displayDate(d.end)+' ('+(cfg.timezone||'UTC')+')\nหลังจบตามแผน '+showValue(after,'sale_price')+' บาท'+(row.bundle_item_pricing?'\nราคาสินค้าในชุดยังบวกเพิ่มตามการตั้งค่า':'')+'\nระบบเก็บราคาและตารางเดิมไว้เพื่อคืนอัตโนมัติ ดูผลการคืนได้ในรายการโปรนี้'+(d.revive&&canRevive(data.baseline,d.end)?'\nคุณเลือกใช้ราคาโปรเดิมต่อแม้หมดอายุ โดยล้างวันเริ่ม–จบเดิม':'');
   if(!await confirmChange(summary,{title:'ตั้งโปรพร้อมแผนคืนราคา',confirmLabel:'ยืนยันตั้งโปรชั่วคราว'}))return;
   if(d.price==='0'&&!await confirmChange('ราคาโปรเป็นศูนย์ ยืนยันให้สินค้านี้ราคา 0?'))return;
+  if(canWrite&&!canWrite())return;
   d.operation={operation_id:uuid(),price:d.price,start:d.start,end:d.end,baseline:data.baseline,confirmed:true,zero_ack:d.price==='0',revive_expired:!!d.revive&&canRevive(data.baseline,d.end)};d.state='saving';setBusy(true);setError('');
   try{await api('products/'+row.id+'/temporary-sales',d.operation);await done();}
   catch(e){if(!(e instanceof ApiError)||e.code==='operation_unknown'){d.state='unknown';setError('ยังยืนยันผลไม่ได้ กดตรวจผลคำสั่งเดิมก่อนตั้งโปรอีกครั้ง');}else{d.state='dirty';d.operation=null;setError(e.message);if(e.code==='field_conflict'){const loaded=await load();setError(e.message+(loaded?' · แสดงราคาเดิมล่าสุดแล้ว กรุณาตรวจและยืนยันใหม่':' · อ่านราคาเดิมล่าสุดไม่สำเร็จ กรุณาลองอีกครั้ง'));}}}
   finally{setBusy(false);render(x=>x+1);signalDraft(row.id);}
  }
  async function inspect(){setBusy(true);try{const r=await api('operations/'+d.operation.operation_id);if(r.status==='succeeded'&&r.result?.ok){await done();}else{setError('ยังยืนยันผลไม่ได้ เก็บรหัส '+d.operation.operation_id+' ให้ผู้ดูแลตรวจสอบ');}}catch(e){setError(e.message+' · เก็บรหัส '+d.operation.operation_id+' ห้ามส่งใหม่');}finally{setBusy(false);}}
- async function closePromo(p){
+ async function checkOperations(p){
+  setOperationCheck({id:p.id,busy:true});
+  try{
+   const result=await api('products/'+row.id+'/temporary-sales/'+p.id+'/review');
+   setOperationCheck({id:p.id,result});
+  }catch(e){setOperationCheck({id:p.id,error:e.message});}
+ }
+ async function closePromo(p,prepareNew=false){
   const review=p.status==='needs_review',pending=p.status==='pending',after=p.revive_expired?p.original.sale_price:restoredPrice(p.original,localMinute(Date.now()/1000));
-  const title=review?'ปิดรายการตรวจสอบ':pending?'ยกเลิกโปรที่รอเริ่ม':'จบโปรก่อนกำหนด';
-  const message=review?'ปิดรายการนี้และคงราคาปัจจุบันไว้ ระบบจะไม่คืนราคาให้':pending?'ยกเลิกก่อนเริ่ม โดยไม่เปลี่ยนราคาสินค้า':'ระบบจะพยายามคืนราคาเป็น '+showValue(after,'sale_price')+' บาท พร้อมตารางเดิม หากข้อมูลยังตรงกัน';
-  if(!await confirmChange(message,{title,confirmLabel:review?'ปิดรายการและคงราคา':pending?'ยืนยันยกเลิกโปร':'ยืนยันจบโปรและคืนราคา'}))return;
-  setBusy(true);try{await api('products/'+row.id+'/temporary-sales/'+p.id+'/cancel',{confirmed:true});await load();onSaved(row.id,'sale_price',row.sale_price,row.revisions.sale_price);}catch(e){await load();setError(e.message+' · ตรวจสถานะล่าสุดก่อนทำต่อ');}finally{setBusy(false);}
+  const title=prepareNew?'ปิดงานเดิมและเตรียมโปรใหม่':review?'ปิดรายการตรวจสอบ':pending?'ยกเลิกโปรที่รอเริ่ม':'จบโปรก่อนกำหนด';
+  const message=prepareNew?'โปรเดิมจะไม่ทำงานต่อหลังปิดงาน ระบบจะคงราคาและวันโปรปัจจุบัน จากนั้นจะเปิดร่างโปร '+showValue(p.price,'sale_price')+' บาท ให้เลือกเวลาใหม่ ราคาจะเปลี่ยนเมื่อยืนยันโปรใหม่และถึงเวลาเริ่ม':review?'ปิดงานตรวจสอบแล้วระบบจะคงราคากับวันโปรที่ใช้อยู่ หากต้องแก้ ให้ไปบันทึกในหน้าสินค้าหลังปิดงาน':pending?'ยกเลิกก่อนเริ่ม โดยไม่เปลี่ยนราคาสินค้า':'ระบบจะพยายามคืนราคาเป็น '+showValue(after,'sale_price')+' บาท พร้อมตารางเดิม หากข้อมูลยังตรงกัน';
+  if(!await confirmChange(message,{title,confirmLabel:prepareNew?'ปิดงานเดิมและเปิดร่าง':review?'ปิดรายการและคงราคา':pending?'ยืนยันยกเลิกโปร':'ยืนยันจบโปรและคืนราคา'}))return;
+  if(canWrite&&!canWrite())return;
+  if(prepareNew&&d.state!=='clean')return;
+  setBusy(true);try{
+   const closed=await api('products/'+row.id+'/temporary-sales/'+p.id+'/cancel',review?{confirmed:true,expected_status:'needs_review'}:{confirmed:true});
+   if(prepareNew&&closed.promotion?.status==='cancelled'){
+    Object.assign(d,{price:p.price,start:'',end:'',revive:false,prepared:true,state:'dirty'});
+    signalDraft(row.id);
+   }
+   await load();
+   if(!prepareNew)onSaved(row.id,'sale_price',row.sale_price,row.revisions.sale_price);
+  }catch(e){await load();setError(e.message+' · ตรวจสถานะล่าสุดก่อนทำต่อ');}finally{setBusy(false);}
  }
 
  const openPlans=(data?.items||[]).filter(p=>['pending','active','needs_review'].includes(p.status));
  const history=(data?.items||[]).filter(p=>!['pending','active','needs_review'].includes(p.status));
  const planDetails=p=>[h('small',{key:'restore'},'คืนเดิม '+showValue(p.original.sale_price,'sale_price')+' · '+showValue(p.original.sale_dates,'sale_dates')+(p.revive_expired?' · เลือกคืนโปรเดิมแม้หมดอายุ: ล้างวันหากหมดอายุเมื่อคืน':' · คืนตารางเดิมตามจริง')),h('small',{key:'message'},p.message)];
- const planTitle=p=>[h('span',{key:'status',className:'sdd-status '+p.status},promoLabels[p.status]||p.status),h('strong',{key:'price'},'ราคาโปร '+showValue(p.price,'sale_price')+' บาท'),h('small',{key:'dates',className:'sdd-history-dates'},promoTime(p.starts_at)+' → '+promoTime(p.ends_at))];
+ const planTitle=p=>[h('span',{key:'status',className:'sdd-status '+p.status},promoLabels[p.status]||p.status),h('strong',{key:'price'},(row.type==='bundle'?'ราคาโปรฐาน ':'ราคาโปร ')+showValue(p.price,'sale_price')+' บาท'),h('small',{key:'dates',className:'sdd-history-dates'},promoTime(p.starts_at)+' → '+promoTime(p.ends_at))];
  return h('div',{className:'sdd-temporary'},h('div',{className:'sdd-temporary-layout'},
  h('section',{className:'sdd-promo-history','aria-label':'ประวัติโปรชั่วคราว'},h('h3',null,'โปรที่สิ้นสุดในรายการล่าสุด',data&&h('span',{className:'sdd-history-count'},history.length.toLocaleString('th-TH')+' รายการ')),
  h('div',{className:'sdd-history-scroll',tabIndex:0,role:'region','aria-label':'รายการประวัติโปรชั่วคราว'},!data&&h('p',{className:'sdd-plan-help'},readError?'ยังโหลดประวัติไม่ได้':'กำลังโหลดประวัติ…'),data&&!history.length&&h('p',{className:'sdd-plan-help'},'ยังไม่มีประวัติโปรชั่วคราว'),history.map(p=>h('details',{key:p.id,className:'sdd-promotion sdd-history-item'},h('summary',null,planTitle(p),h('span',{className:'sdd-history-more'},'ดูรายละเอียด')),h(RestorationCard,{plan:p,currentPrice:data?.current_price}),planDetails(p))))),
  h('section',{className:'sdd-promo-editor','aria-label':'จัดการโปรชั่วคราว'},h('h3',null,livePlan?'โปรชั่วคราวปัจจุบัน':'ตั้งโปรชั่วคราว'),
- data?.server_time&&h('p',{className:'sdd-last-loaded'},(readError?'ข้อมูลก่อนหน้า · ตรวจล่าสุด ':'ตรวจสถานะล่าสุด ')+promoTime(data.server_time)+' · ตรวจซ้ำเมื่อเปิดหน้านี้ทุก 30 วินาที'),openPlans.map(p=>h('div',{key:p.id,className:'sdd-promotion sdd-current-promotion'},planTitle(p),h(RestorationCard,{plan:p,currentPrice:data?.current_price,automation:data?.automation}),p.status==='needs_review'&&h('p',{className:'sdd-plan-help'},p.message),h('button',{disabled:busy||readError,onClick:()=>closePromo(p)},p.status==='needs_review'?'ปิดรายการและคงราคาปัจจุบัน':p.status==='pending'?'ยกเลิกโปรที่รอเริ่ม':'จบโปรก่อนกำหนด'))),
+ row.bundle_item_pricing&&h('p',{className:'sdd-plan-help'},'ราคาสินค้าในชุดยังบวกเพิ่มตามการตั้งค่า'),
+ data?.server_time&&h('p',{className:'sdd-last-loaded'},(readError?'ข้อมูลก่อนหน้า · ตรวจล่าสุด ':'ตรวจสถานะล่าสุด ')+promoTime(data.server_time)+' · ตรวจซ้ำเมื่อเปิดหน้านี้ทุก 30 วินาที'),openPlans.map(p=>h('div',{key:p.id,className:'sdd-promotion sdd-current-promotion'},planTitle(p),p.status==='pending'&&h('p',{role:'status',className:'sdd-plan-help'},p.starts_at>Number(data.server_time)?'บันทึกแผนแล้ว · เริ่ม '+promoTime(p.starts_at):'ถึงเวลาเริ่มตามแผนแล้ว · รอระบบเริ่มใช้ราคาโปร'),h(RestorationCard,{plan:p,currentPrice:data?.current_price,automation:data?.automation,onAudit,onCloseReview:busy||readError||operationCheck?.busy?undefined:()=>closePromo(p),onCheck:()=>checkOperations(p),check:operationCheck?.id===p.id?operationCheck:null,onRestart:p.status==='needs_review'&&!data.automation?.blocked&&!priceReadonly&&!busy&&!readError&&!operationCheck?.busy&&d.state==='clean'?()=>closePromo(p,true):undefined}),p.status!=='needs_review'&&h('button',{disabled:busy||readError,onClick:()=>closePromo(p)},p.status==='pending'?'ยกเลิกโปรที่รอเริ่ม':'จบโปรก่อนกำหนด'))),
  h(livePlan?'details':'div',{className:'sdd-promo-reference'},livePlan&&h('summary',null,'ดูราคาและตารางเดิมที่เก็บไว้'),data?.baseline&&h('strong',null,'ราคาเดิมที่เก็บไว้ · ปกติ '+showValue((livePlan?.original||data.baseline).regular_price,'regular_price')+' · ราคาโปร '+showValue((livePlan?.original||data.baseline).sale_price,'sale_price')),h('div',{className:'sdd-original-schedule',role:'note'},h('div',{className:'sdd-original-schedule-head'},h('span',{className:'sdd-status '+originalState.className},originalState.label)),h('div',{className:'sdd-original-schedule-dates'},h('span',null,'เริ่ม '+(originalDates.split('|')[0]?promoTime(originalDates.split('|')[0]):'ไม่กำหนด')),h('span',null,'สิ้นสุด '+(originalDates.split('|')[1]?promoTime(originalDates.split('|')[1]):'ไม่กำหนด'))),h('small',null,'เลือกวันเริ่ม–สิ้นสุดของโปรชั่วคราวได้เอง โดยไม่เปลี่ยนวันโปรเดิม · ช่องกรอกใช้ปี ค.ศ. เช่น 2026'))),
  busy&&!data&&h('p',{role:'status'},'กำลังอ่านราคาเดิมและประวัติโปร…'),
- data&&!livePlan&&h('div',{className:'sdd-plan-grid'},h('div',null,h('label',{className:'sdd-plan-field'},'ราคาโปรชั่วคราว (บาท)',h('input',{'aria-label':'ราคาโปรชั่วคราว #'+row.id,inputMode:'numeric',maxLength:19,value:displayPrice(d.price),disabled:busy||readError||d.state==='unknown'||priceReadonly,onChange:e=>editPrice(e,v=>change('price',v))})),h('div',{className:'sdd-plan-dates'},['start','end'].map((field,i)=>h('label',{className:'sdd-plan-field sdd-plan-date-field',key:field},i?'สิ้นสุดโปรชั่วคราว':'เริ่มโปรชั่วคราว',h(DateTimePicker,{id:'sdd-promo-'+row.id+'-'+field,label:(i?'สิ้นสุด':'เริ่ม')+'โปรชั่วคราว #'+row.id,value:d[field],defaultTime:i?'23:59':'00:00',disabled:busy||readError||d.state==='unknown'||priceReadonly,onChange:value=>change(field,value)})))),h('p',{className:'sdd-plan-help'},'หากเวลาเริ่มผ่านไปแล้ว ระบบจะพยายามเริ่มทันทีหลังยืนยัน · เขตเวลา '+(cfg.timezone||'UTC'))),
- h('div',null,canRevive(data.baseline,d.end)&&h('label',{className:'sdd-revive-choice'},h('input',{type:'checkbox',checked:!!d.revive,disabled:busy||readError||d.state==='unknown'||priceReadonly,onChange:e=>change('revive',e.target.checked)}),' หลังจบโปรชั่วคราว ให้กลับมาใช้ราคาโปรเดิมแม้หมดอายุแล้ว'),h(PlanSummary,{row:{...row,...data.baseline},price:d.price,dates:d.start+'|'+d.end,temporary:true,revive:!!d.revive&&canRevive(data.baseline,d.end)}),h('p',{className:'sdd-plan-help'},'ระบบเก็บราคาและตารางเดิมไว้เพื่อคืนหลังจบ ดูแผนและผลการคืนได้ในรายการโปรนี้'),h('div',{className:'sdd-plan-actions'},h('button',{className:'sdd-primary',disabled:busy||readError||d.state==='unknown'||priceReadonly,onClick:save},'ยืนยันตั้งโปรชั่วคราว'),d.state!=='unknown'&&h('button',{disabled:busy,onClick:()=>{d.price='';d.start='';d.end='';d.revive=false;d.state='clean';render(x=>x+1);signalDraft(row.id);}},'ล้างข้อมูลที่กรอก')))),
+ data?.automation?.reason&&h('p',{role:'alert',className:'sdd-error'},data.automation.reason),
+ data&&!livePlan&&row.type==='bundle'&&priceReadonly&&data.price_reasons?.length>0&&h('p',{role:'status',className:'sdd-plan-help'},data.price_reasons.join(' · ')),
+ data&&!livePlan&&d.prepared&&h('p',{role:'status',className:'sdd-plan-help'},'ร่างโปรใหม่พร้อมแล้ว · เลือกวันเริ่มและสิ้นสุด แล้วตรวจสรุปก่อนยืนยัน'),
+ data&&!livePlan&&h('div',{className:'sdd-plan-grid'},h('div',null,h('label',{className:'sdd-plan-field'},row.type==='bundle'?'ราคาโปรฐาน (บาท)':'ราคาโปรชั่วคราว (บาท)',h('input',{'aria-label':(row.type==='bundle'?'ราคาโปรฐาน #':'ราคาโปรชั่วคราว #')+row.id,id:'sdd-promo-'+row.id+'-price','aria-invalid':fieldError?.[0]==='price'||undefined,'aria-describedby':fieldError?.[0]==='price'?'sdd-promo-'+row.id+'-price-error':undefined,inputMode:'numeric',maxLength:19,value:displayPrice(d.price),disabled:busy||readError||d.state==='unknown'||priceReadonly,onChange:e=>editPrice(e,v=>change('price',v))}),fieldError?.[0]==='price'&&h('small',{id:'sdd-promo-'+row.id+'-price-error',role:'alert',className:'sdd-error'},fieldError[1])),h('div',{className:'sdd-plan-dates'},['start','end'].map((field,i)=>h('label',{className:'sdd-plan-field sdd-plan-date-field',key:field,ref:i?null:newStart},i?'สิ้นสุดโปรชั่วคราว':'เริ่มโปรชั่วคราว',h(DateTimePicker,{id:'sdd-promo-'+row.id+'-'+field,label:(i?'สิ้นสุด':'เริ่ม')+'โปรชั่วคราว #'+row.id,value:d[field],defaultTime:i?'23:59':'00:00',invalid:fieldError?.[0]===field,describedBy:fieldError?.[0]===field?'sdd-promo-'+row.id+'-'+field+'-error':undefined,disabled:busy||readError||d.state==='unknown'||priceReadonly,onChange:value=>change(field,value)}),fieldError?.[0]===field&&h('small',{id:'sdd-promo-'+row.id+'-'+field+'-error',role:'alert',className:'sdd-error'},fieldError[1])))),h('p',{className:'sdd-plan-help'},'หากเวลาเริ่มผ่านไปแล้ว ระบบจะพยายามเริ่มทันทีหลังยืนยัน · เขตเวลา '+(cfg.timezone||'UTC'))),
+ h('div',null,canRevive(data.baseline,d.end)&&h('label',{className:'sdd-revive-choice'},h('input',{type:'checkbox',checked:!!d.revive,disabled:busy||readError||d.state==='unknown'||priceReadonly,onChange:e=>change('revive',e.target.checked)}),' หลังจบโปรชั่วคราว ให้กลับมาใช้ราคาโปรเดิมแม้หมดอายุแล้ว'),h(PlanSummary,{row:{...row,...data.baseline},price:d.price,dates:d.start+'|'+d.end,temporary:true,revive:!!d.revive&&canRevive(data.baseline,d.end)}),h('p',{className:'sdd-plan-help'},'ระบบเก็บราคาและตารางเดิมไว้เพื่อคืนหลังจบ ดูแผนและผลการคืนได้ในรายการโปรนี้'),h('div',{className:'sdd-plan-actions'},h('button',{className:'sdd-primary',disabled:busy||readError||d.state==='unknown'||priceReadonly||!!data.automation?.reason,onClick:save},'ตรวจสรุปโปรชั่วคราว'),d.state!=='unknown'&&h('button',{disabled:busy,onClick:()=>{d.price='';d.start='';d.end='';d.revive=false;d.prepared=false;d.state='clean';setFieldError(null);render(x=>x+1);signalDraft(row.id);}},'ล้างข้อมูลที่กรอก')))),
  d.state==='unknown'&&h('button',{disabled:busy,onClick:inspect},'ตรวจผลคำสั่งโปร'),d.state==='unknown'&&!error&&h('p',{role:'alert',className:'sdd-error'},'ยังไม่ยืนยันผล กดตรวจผลคำสั่งก่อนทำต่อ'),error&&h('p',{role:'alert',className:'sdd-error'},error),readError&&h('button',{disabled:busy,onClick:load},'ลองโหลดข้อมูลอีกครั้ง'))));
 
 }
@@ -628,14 +772,14 @@ function referenceAt(row,at){
 function restoredPrice(row,at){const [from,to]=(row.sale_dates||'|').split('|');return hasOriginalSale(row)&&(!from||localMinute(from)<=at)&&(!to||localMinute(to)>=at)?row.sale_price:row.regular_price;}
 function PlanSummary({row,price,dates,revive}){
  const [start,end]=(dates||'|').split('|'),now=localMinute(Date.now()/1000),reference=referenceAt(row,start&&start>now?start:now),after=revive?row.sale_price:restoredPrice(row,end||now);
- return h('section',{className:'sdd-plan-summary','aria-label':'สรุปผลโปร'},h('strong',null,'ราคาโปรและแผนคืนราคา'),price!==''&&Number(price)>Number(restoredPrice(row,start||now))&&h('p',{className:'sdd-summary-warning'},'ราคาใหม่สูงกว่าราคาก่อนเริ่มตามตารางเดิม '+displayPrice(String(Number(price)-Number(restoredPrice(row,start||now))))) ,
+ return h('section',{className:'sdd-plan-summary','aria-label':'สรุปผลโปร'},h('strong',null,row.type==='bundle'?'ราคาฐานและแผนคืนราคา':'ราคาโปรและแผนคืนราคา'),price!==''&&Number(price)>Number(restoredPrice(row,start||now))&&h('p',{className:'sdd-summary-warning'},'ราคาใหม่สูงกว่าราคาก่อนเริ่มตามตารางเดิม '+displayPrice(String(Number(price)-Number(restoredPrice(row,start||now))))) ,
  [['ก่อนเริ่มตามตารางเดิม',restoredPrice(row,start||now)],['ระหว่างโปร',price===''?'':price],['หลังจบตามตารางเดิม',after]].flatMap(([label,value],index)=>[h('div',{className:'sdd-plan-stage',key:label},h('span',null,label),h('strong',null,showValue(value,label==='ราคาปกติ'?'regular_price':'sale_price'))),index<2&&h('span',{className:'sdd-plan-arrow','aria-hidden':true,key:'arrow-'+index},'→')].filter(Boolean)),
  h('div',{className:'sdd-plan-context',role:'group','aria-label':'รายละเอียดราคาอ้างอิง วันโปรเดิม และการคืนราคา'},h('span',null,'ราคาปกติอ้างอิง '+showValue(reference.price,'regular_price')+' บาท · ราคานี้ยังไม่รวมคูปองหรือส่วนลดในตะกร้า'),h('span',null,showValue(dates,'sale_dates')+' · '+(cfg.timezone||'UTC')),h('strong',{className:'sdd-return-plan'},'↩ ตั้งให้กลับเป็น '+showValue(after,'sale_price')+' บาทหลังจบ'),h('details',null,h('summary',null,'ดูเงื่อนไขการคืนราคา'),h('span',null,revive?'คืนโปรเดิมและล้างวันเริ่ม–จบ เพื่อใช้โปรเดิมต่อ':'ระบบเก็บตารางเดิมไว้ หากโปรเดิมหมดอายุแล้วจะใช้ราคาปกติ'),h('span',null,'หากมีการแก้ราคาแทรก ระบบจะหยุดให้ตรวจสอบ และงานอัตโนมัติอาจทำให้คืนราคาช้ากว่ากำหนด'))));
 }
 
-function PromotionPanel({row,onSaved,onClose}){
- return h('section',{id:'sdd-promotion-panel-'+row.id,tabIndex:-1,className:'sdd-promotion-panel','data-sdd-focus-field':'temporary_sale','aria-label':'จัดการโปร #'+row.id},h('div',{className:'sdd-panel-head'},h('div',null,h('h2',null,'จัดการโปร · ',row.name),h('small',null,'#'+row.id+' · '+(row.sku||'ไม่มี SKU')+' · ราคาปกติ '+showValue(row.regular_price,'regular_price')+' / ราคาโปรที่บันทึก '+showValue(row.sale_price,'sale_price'))),h('button',{onClick:onClose,'aria-label':'ปิดแผงจัดการโปร '+row.name},'ปิดแผง ×')),
- h('aside',{className:'sdd-promo-product-card'},row.thumbnail_url&&h('img',{src:row.thumbnail_url,alt:row.name}),h('span',{className:'sdd-dashboard-eyebrow'},'สินค้าที่กำลังจัดการ'),h('h3',null,row.name),h(CacheUpdateStatus,{id:row.id,detail:true}),h('p',null,'SKU: '+(row.sku||'ไม่ระบุ')+' · #'+row.id),h('span',{className:'sdd-status active'},'เผยแพร่แล้ว'),h('div',{className:'sdd-promo-product-price'},h('span',null,'ราคาปกติอ้างอิง'),h('strong',null,showValue(row.regular_price,'regular_price')+' บาท')),h('p',{className:'sdd-plan-help'},'ราคาโปรยังอาจได้รับส่วนลดเพิ่มเติมจากกฎในตะกร้าหรือคูปอง')),cfg.canSettings?h(TemporarySale,{row,onSaved}):h('p',{className:'sdd-plan-help'},'เฉพาะผู้ดูแลระบบสามารถตั้งโปรชั่วคราวได้'));
+function PromotionPanel({row,onSaved,onClose,canWrite,onAudit}){
+ return h('section',{id:'sdd-promotion-panel-'+row.id,tabIndex:-1,className:'sdd-promotion-panel','data-sdd-focus-field':'temporary_sale','aria-label':'จัดการโปร #'+row.id},h('div',{className:'sdd-panel-head'},h('div',null,h('h2',null,row.type==='bundle'?'โปรชั่วคราวของชุด · ':'จัดการโปร · ',row.name),h('small',null,'#'+row.id+' · '+(row.sku||'ไม่มี SKU')+' · ราคาปกติ '+showValue(row.regular_price,'regular_price')+' / ราคาโปรที่บันทึก '+showValue(row.sale_price,'sale_price'))),h('button',{onClick:onClose,'aria-label':'ปิดแผงจัดการโปร '+row.name},'ปิดแผง ×')),
+ h('aside',{className:'sdd-promo-product-card'},row.thumbnail_url&&h('img',{src:row.thumbnail_url,alt:row.name}),h('span',{className:'sdd-dashboard-eyebrow'},'สินค้าที่กำลังจัดการ'),h('h3',null,row.name),h(CacheUpdateStatus,{id:row.id,detail:true}),h('p',null,'SKU: '+(row.sku||'ไม่ระบุ')+' · #'+row.id),h('span',{className:'sdd-status active'},'เผยแพร่แล้ว'),h('div',{className:'sdd-promo-product-price'},h('span',null,'ราคาปกติอ้างอิง'),h('strong',null,showValue(row.regular_price,'regular_price')+' บาท')),!row.bundle_item_pricing&&h('p',{className:'sdd-plan-help'},'ราคาโปรยังอาจได้รับส่วนลดเพิ่มเติมจากกฎในตะกร้าหรือคูปอง')),cfg.canSettings?h(TemporarySale,{row,onSaved,canWrite,onAudit:cfg.canAudit&&onAudit?()=>onAudit(row.id):undefined}):h('p',{className:'sdd-plan-help'},'เฉพาะผู้ดูแลระบบสามารถตั้งโปรชั่วคราวได้'));
 }
 function Confirmation({request,onDone}){
  const dialog=useRef(null),cancel=useRef(null);
@@ -649,6 +793,14 @@ function priceRange(minimum,maximum){
 function VariablePriceSummary({summary}){
  return h('div',{className:'sdd-variable-price-summary'},h('strong',null,priceRange(summary?.regular_min,summary?.regular_max)),h('small',null,summary?.count?'ช่วงราคาจาก '+summary.count+' ตัวเลือก':'ยังไม่มีข้อมูลราคา'));
 }
+function StockPill({row}){
+ const hasQuantity=Number.isFinite(row.stock_quantity);
+ const showStatus=!hasQuantity||row.stock_status!=='instock';
+ return h('span',{className:'sdd-stock-pill'+(hasQuantity?' sdd-stock-pill-with-quantity':''),'data-stock-status':row.stock_status},
+  showStatus&&showValue(row.stock_status,'stock_status'),
+  hasQuantity&&h('span',{className:'sdd-stock-quantity'},row.stock_quantity_shared?'สต๊อกร่วม ':'คงเหลือ ',
+   row.stock_quantity.toLocaleString('th-TH',{maximumFractionDigits:20}),row.type==='bundle'?' ชุด':' ชิ้น'));
+}
 function MobileProductPrices({row}){
  const parent=row.type==='variable',summary=row.variation_summary;
  const current=parent?priceRange(summary?.current_min,summary?.current_max):showValue(row.current_price??'','sale_price');
@@ -656,7 +808,7 @@ function MobileProductPrices({row}){
   h('span',{className:'sdd-mobile-current-price'},'ราคาในระบบตอนนี้',h('b',null,current,current!=='—'?' บาท':'')),
   h('span',null,parent?'ช่วงราคาปกติ':'ราคาปกติ',h('b',null,parent?priceRange(summary?.regular_min,summary?.regular_max):showValue(row.regular_price,'regular_price'))),
   h('span',null,'ราคาโปรที่บันทึก',h('b',null,parent?'มีโปร '+(summary?.sale_count||0)+' / '+(summary?.count||0)+' ตัวเลือก':showValue(row.sale_price,'sale_price'))),
-  h('span',null,stock[row.stock_status]||row.stock_status));
+  row.type==='bundle'||row.stock_by_quantity||Number.isFinite(row.stock_quantity)?h(StockPill,{row}):h('span',null,showValue(row.stock_status,'stock_status')));
 }
 function VariableSaleSummary({summary}){
  const count=summary?.sale_count||0,total=summary?.count||0;
@@ -675,33 +827,54 @@ function CatalogPromotionTiming({row}){
  if(schedule?.state==='active'&&schedule.to)return h('small',{className:'sdd-promo-timing'},'สิ้นสุด '+promoTime(Date.parse(schedule.to)/1000));
  return null;
 }
-function ProductRow({row,onSaved,open,onExpand,promoId,onPromo,scope,onAudit,onOpen}){
+function ProductRow({row,onSaved,open,onExpand,promoId,onPromo,scope,onAudit,onOpen,canWrite,bulkSelection,onSelectBulk}){
  const parent=row.type==='variable',summary=row.variation_summary,promoOpen=promoId===row.id;
+ const bundle=row.type==='bundle';
+ const canManageBundlePromo=bundle&&cfg.canSettings&&row.bundle_temp_promo&&row.edit_url;
+ const bulkSelected=!!onSelectBulk&&bulkSelection.has(row.id);
+ const showBulkCheckbox=!!onSelectBulk&&['simple','variation'].includes(row.type);
  const presence=workspacePresence.get(row.id)||[];
  const promoStatus=row.temporary_sale?h('span',{className:'sdd-status '+row.temporary_sale.status},promoLabels[row.temporary_sale.status]):row.sale_schedule&&row.sale_schedule.state!=='none'?h('span',{className:'sdd-status '+({active:'active',future:'pending',expired:'expired',invalid:'needs_review'}[row.sale_schedule.state]||'')},({active:'โปรกำลังใช้',future:'โปรรอเริ่ม',expired:'โปรเดิมหมดอายุ',invalid:'ตรวจวันโปร'})[row.sale_schedule.state]):!parent&&Number(row.sale_price)>0&&Number(row.sale_price)<Number(row.regular_price)?h('span',{className:'sdd-status active'},'ราคาโปรถาวร'):null;
- return h(wp.element.Fragment,null,h('tr',{'data-product-id':row.id,className:(row.stock_status==='outofstock'?'sdd-out ':row.stock_status==='onbackorder'?'sdd-backorder ':'')+(row.parent_id?'sdd-child ':'')+(promoOpen?'sdd-row-active ':'')+(parent&&open?'sdd-variable-open':'')},
- h('td',{className:'sdd-thumbnail-cell'},row.thumbnail_url?h('img',{src:row.thumbnail_url,alt:'',width:40,height:40,loading:'lazy'}):h('span',{className:'sdd-thumb'},'—')),
+ return h(wp.element.Fragment,null,h('tr',{'data-product-id':row.id,className:(row.stock_status==='outofstock'?'sdd-out ':row.stock_status==='onbackorder'?'sdd-backorder ':'')+(row.parent_id?'sdd-child ':'')+(promoOpen?'sdd-row-active ':'')+(bulkSelected?'sdd-bulk-selected ':'')+(parent&&open?'sdd-variable-open':'')},
+ h('td',{className:'sdd-thumbnail-cell'+(onSelectBulk?' sdd-thumbnail-with-selection':'')},
+  h('div',{className:'sdd-catalog-row-media'},
+   showBulkCheckbox&&h('label',{className:'sdd-catalog-checkbox'},h('input',{type:'checkbox',checked:bulkSelected,disabled:!bulkSelected&&!row.editable.regular_price&&!row.editable.sale_price,'aria-label':'เลือก '+row.name+' สำหรับแก้หลายรายการ',onChange:e=>onSelectBulk(row,e.target.checked)})),
+   row.thumbnail_url?h('img',{src:row.thumbnail_url,alt:'',width:40,height:40,loading:'lazy'}):h('span',{className:'sdd-thumb'},'—'))),
  h('td',{className:'sdd-product'},parent&&h('button',{className:'sdd-expand','aria-expanded':open,'aria-label':(open?'ยุบ':'ขยาย')+'ตัวเลือก #'+row.id,onClick:onExpand},open?'− ยุบตัวเลือก':'+ ดูตัวเลือก ('+(summary?.count||0)+')'),' ',row.edit_url?h('a',{id:'sdd-product-name-'+row.id,href:row.edit_url,target:'_blank',rel:'noopener noreferrer'},row.name):h('span',{id:'sdd-product-name-'+row.id},row.name),
- h('small',null,h('code',null,row.sku||'ไม่มี SKU'),(row.brands.length?' · '+row.brands.join(', '):'')+(summary?' · '+summary.count+' ตัวเลือก':'')),row.attributes&&h('small',{className:'sdd-variation-attributes'},row.attributes),h(MobileProductPrices,{row}),h(CacheUpdateStatus,{id:row.id,compact:true}),row.latest_change&&h('small',{className:'sdd-latest-change'},'แก้ราคาล่าสุด '+promoTime(Date.parse(row.latest_change)/1000)),h('details',{className:'sdd-product-meta'},h('summary',null,'รายละเอียดสินค้า'),h('small',null,'สินค้า #'+row.id),cfg.canAudit&&h('button',{className:'sdd-audit-row-link',onClick:()=>onAudit(row.id)},'ประวัติราคา')),
- presence.length>0&&h('small',{className:'sdd-presence',role:'status'},presence.map(p=>(p.own_user?'อีกแท็บของคุณ':p.actor)+' กำลังแก้'+(labels[p.field]||'โปรชั่วคราว')).join(' · ')),row.readonly_reasons.length>0&&h('details',null,h('summary',null,'ข้อจำกัดการแก้ไข'),h('small',{className:'sdd-reason'},row.readonly_reasons.join(' · ')),row.edit_url&&h('a',{className:'sdd-wc-link',href:row.edit_url,target:'_blank',rel:'noopener noreferrer'},'แก้ไขใน WooCommerce ↗'))),
- ['regular_price','sale_price','stock_status'].map(field=>h('td',{key:field,'data-label':labels[field],className:(field==='regular_price'||field==='sale_price'?'sdd-price-cell':field==='stock_status'?'sdd-stock-cell':'')+(parent?' sdd-aggregate-cell':'')},parent?field==='regular_price'?h(VariablePriceSummary,{summary}):field==='sale_price'?h(VariableSaleSummary,{summary}):h(VariableStockSummary,{summary}):h(wp.element.Fragment,null,h(Cell,{row,field,onSaved}),field==='sale_price'&&row.current_price!=null&&row.current_price!==row.sale_price&&h('small',{className:'sdd-current-system-price'},'ใช้ในระบบตอนนี้ '+showValue(row.current_price,'sale_price')+' บาท')))),
+ h('small',null,h('code',null,row.sku||'ไม่มี SKU'),(row.brands.length?' · '+row.brands.join(', '):'')+(summary?' · '+summary.count+' ตัวเลือก':'')),row.attributes&&h('small',{className:'sdd-variation-attributes'},row.attributes),bundle&&h('span',{className:'sdd-catalog-bundle'},row.bundle_item_pricing?'สินค้าชุด · คิดราคาสินค้าในชุดเพิ่ม':'สินค้าชุด'),h(MobileProductPrices,{row}),h(CacheUpdateStatus,{id:row.id,compact:true}),row.latest_change&&h('small',{className:'sdd-latest-change'},'แก้ราคาล่าสุด '+promoTime(Date.parse(row.latest_change)/1000)),h('details',{className:'sdd-product-meta'},h('summary',null,'รายละเอียดสินค้า'),h('small',null,'สินค้า #'+row.id),bundle&&row.edit_url&&h('a',{className:'sdd-wc-link',href:row.edit_url,target:'_blank',rel:'noopener noreferrer'},'แก้ราคาปกติและส่วนประกอบใน WooCommerce'),cfg.canAudit&&h('button',{className:'sdd-audit-row-link',onClick:()=>onAudit(row.id)},'ประวัติราคา')),
+ presence.length>0&&h('small',{className:'sdd-presence',role:'status'},presence.map(p=>(p.own_user?'อีกแท็บของคุณ':p.actor)+' กำลังแก้'+(labels[p.field]||'โปรชั่วคราว')).join(' · ')),row.readonly_reasons.length>0&&h('details',null,h('summary',null,'ข้อจำกัดการแก้ไข'),h('small',{className:'sdd-reason'},row.readonly_reasons.join(' · ')),row.edit_url&&!bundle&&!row.stock_by_quantity&&h('a',{className:'sdd-wc-link',href:row.edit_url,target:'_blank',rel:'noopener noreferrer'},'แก้ไขใน WooCommerce ↗'))),
+ ['regular_price','sale_price','stock_status'].map(field=>h('td',{key:field,'data-label':labels[field],className:(field==='stock_status'?'sdd-stock-cell':'sdd-price-cell')+(parent?' sdd-aggregate-cell':'')},
+  field==='stock_status'?(
+   parent?h(wp.element.Fragment,null,h(VariableStockSummary,{summary}),Number.isFinite(row.stock_quantity)&&h(StockPill,{row})):
+   bundle||row.stock_by_quantity||Number.isFinite(row.stock_quantity)?h(StockPill,{row}):h(Cell,{row,field,onSaved,canWrite})):
+  parent?field==='regular_price'?h(VariablePriceSummary,{summary}):h(VariableSaleSummary,{summary}):
+  h(wp.element.Fragment,null,h(Cell,{row,field,onSaved,canWrite}),field==='sale_price'&&row.current_price!=null&&row.current_price!==row.sale_price&&h('small',{className:'sdd-current-system-price'},'ใช้ในระบบตอนนี้ '+showValue(row.current_price,'sale_price')+' บาท')))),
  h('td',{className:'sdd-promo-status'},promoStatus||h('span',{className:'sdd-empty-status','aria-label':'ไม่มีโปรโมชัน'},'—'),h(CatalogPromotionTiming,{row}),row.temporary_sale?.status==='needs_review'&&h('small',{className:'sdd-error'},row.temporary_sale.message)),
- h('td',{className:'sdd-action-cell'},!parent&&h('button',{className:'sdd-mobile-edit',onClick:()=>onOpen(row.id,'regular_price')},'เปิดแก้ไขสินค้า →'),!parent&&['simple','variation'].includes(row.type)?h('button',{id:'sdd-promo-toggle-'+row.id,'aria-expanded':promoOpen,'aria-controls':promoOpen?'sdd-promotion-panel-'+row.id:undefined,'aria-label':'จัดการโปร #'+row.id,'aria-describedby':'sdd-product-name-'+row.id,onClick:()=>onPromo(promoOpen?null:row.id)},'จัดการโปร'):h('span',{className:'sdd-empty-status','aria-hidden':true},'—'))),
- promoOpen&&h('tr',{className:'sdd-promotion-row','data-promotion-for':row.id},h('td',{colSpan:7},h(PromotionPanel,{row,onSaved,onClose:()=>{onPromo(null);requestAnimationFrame(()=>document.getElementById('sdd-promo-toggle-'+row.id)?.focus());}}))));
+ h('td',{className:'sdd-action-cell'},h('div',{className:'sdd-catalog-row-actions'},
+  !parent&&(!bundle||row.editable.regular_price||row.editable.sale_price)&&h('button',{className:'sdd-mobile-edit',onClick:()=>onOpen(row.id,bundle&&!row.editable.regular_price?'sale_price':'regular_price')},'เปิดแก้ไขสินค้า →'),
+  !parent&&(['simple','variation'].includes(row.type)||canManageBundlePromo)&&h('button',{className:bundle?'sdd-bundle-promo-action':undefined,id:'sdd-promo-toggle-'+row.id,'aria-expanded':promoOpen,'aria-controls':promoOpen?'sdd-promotion-panel-'+row.id:undefined,'aria-label':'จัดการโปร #'+row.id,'aria-describedby':'sdd-product-name-'+row.id,onClick:()=>onPromo(promoOpen?null:row.id)},'จัดการโปร'),
+  ((bundle&&!canManageBundlePromo)||parent)&&h('span',{className:'sdd-empty-status','aria-hidden':true},'—')))),
+ promoOpen&&h('tr',{className:'sdd-promotion-row','data-promotion-for':row.id},h('td',{colSpan:7},h(PromotionPanel,{row,onSaved,canWrite,onAudit,onClose:()=>{onPromo(null);requestAnimationFrame(()=>document.getElementById('sdd-promo-toggle-'+row.id)?.focus());}}))));
 }
-function ProductGroup({row,context,onSaved,promoId,onPromo,onAudit,onOpen}){
- const [open,setOpen]=useState(false),[page,setPage]=useState(1),[size,setSize]=useState(20),[all,setAll]=useState(false),[data,setData]=useState({items:[],total:0,pages:0}),[busy,setBusy]=useState(false),[error,setError]=useState('');
- const contextKey=JSON.stringify(context); const filterKey=JSON.stringify({...context,tick:0});
+function ProductGroup({row,context,onSaved,promoId,onPromo,onAudit,onOpen,canWrite,bulkSelection,onSelectBulk}){
+ const [open,setOpen]=useState(false),[page,setPage]=useState(1),[size,setSize]=useState(20),[all,setAll]=useState(false),[data,setData]=useState({items:[],total:0,pages:0}),[busy,setBusy]=useState(false),[error,setError]=useState(''),[retry,setRetry]=useState(0);
+ const filterKey=JSON.stringify({...context,tick:0});
+ const params=new URLSearchParams({...context,page,per_page:size,all:all?'1':'0'});
+ params.delete('tick');
+ const requestKey=row.id+':'+params+':'+context.tick+':'+retry;
+ const matches=data.requestKey===requestKey;
+ const allowedRequest=useRef(null);
+ allowedRequest.current=open&&matches&&!busy&&!error?requestKey:null;
+ const canWriteChild=()=>allowedRequest.current===requestKey&&(!canWrite||canWrite());
  useEffect(()=>{const receive=e=>setData(d=>({...d,items:mergeLiveRows(d.items,e.detail)}));window.addEventListener('sdd:workspace-sync',receive);return()=>window.removeEventListener('sdd:workspace-sync',receive);},[]);
  useEffect(()=>{setPage(1);setAll(false);},[filterKey]);
  useEffect(()=>{let live=true;if(!open||row.type!=='variable')return;setBusy(true);setError('');setData({items:[],total:0,pages:0});
-  const params=new URLSearchParams({...context,page,per_page:size,all:all?'1':'0'});params.delete('tick');
-  api('products/'+row.id+'/variations?'+params).then(r=>{if(live)setData(r);}).catch(e=>{if(live)setError(e.message);}).finally(()=>{if(live)setBusy(false);});return()=>{live=false;};
- },[open,row.id,contextKey,page,size,all]);
- function saved(id,field,value,revision){setData(d=>({...d,items:d.items.map(r=>r.id===id?{...r,[field]:value,revisions:{...r.revisions,[field]:revision}}:r)}));onSaved(id,field,value,revision);}
- return h(wp.element.Fragment,null,h(ProductRow,{row,onSaved,promoId,onPromo,scope:context.scope,onAudit,onOpen,open,onExpand:()=>setOpen(v=>!v)}),open&&row.type==='variable'&&h(wp.element.Fragment,null,
- h('tr',{className:'sdd-child-tools'},h('td',{colSpan:7},h('div',{className:'sdd-child-toolbar'},h('strong',null,'ตัวเลือกสินค้า · '+row.name),h('span',null,all?'แสดงทั้งหมด — อาจอยู่นอกคำค้น/สถานะที่กรอง':'แสดงเฉพาะตัวเลือกที่ตรงคำค้น/ตัวกรอง'),h('button',{onClick:()=>{setAll(v=>!v);setPage(1);}},all?'แสดงเฉพาะที่ตรงตัวกรอง':'แสดงตัวเลือกทั้งหมด'),h('span',null,busy?'กำลังโหลด…':data.total+' ตัวเลือก'),h('button',{disabled:busy||page<=1,onClick:()=>setPage(v=>v-1),'aria-label':'ตัวเลือกก่อนหน้า #'+row.id},'←'),h('span',null,'หน้า '+page+' / '+Math.max(1,data.pages)),h('button',{disabled:busy||page>=data.pages,onClick:()=>setPage(v=>v+1),'aria-label':'ตัวเลือกถัดไป #'+row.id},'→'),h('select',{'aria-label':'จำนวนตัวเลือกต่อหน้า #'+row.id,value:size,onChange:e=>{setSize(Number(e.target.value));setPage(1);}},[20,50,100].map(n=>h('option',{key:n,value:n},n+' / หน้า')))),error&&h('p',{role:'alert',className:'sdd-error'},error))),
- data.items.map(child=>h(ProductRow,{key:child.id,row:child,onSaved:saved,promoId,onPromo,scope:context.scope,onAudit,onOpen})),!busy&&!error&&!data.items.length&&h('tr',null,h('td',{colSpan:7,className:'sdd-empty'},'ไม่พบตัวเลือกที่ตรงเงื่อนไข')),h('tr',{className:'sdd-child-footer'},h('td',{colSpan:7},h('span',null,'สิ้นสุดตัวเลือก · '+row.name),h('button',{'aria-label':'ปิดกลุ่มตัวเลือก #'+row.id,onClick:()=>setOpen(false)},'ยุบตัวเลือก')))));
+  api('products/'+row.id+'/variations?'+params).then(r=>{if(live)setData({...r,requestKey});}).catch(e=>{if(live)setError(e.message);}).finally(()=>{if(live)setBusy(false);});return()=>{live=false;allowedRequest.current=null;};
+ },[open,requestKey]);
+ function saved(id,field,value,revision,result){setData(d=>({...d,items:d.items.map(r=>applyPriceRow(r,id,field,value,revision,result))}));onSaved(id,field,value,revision,result);}
+ return h(wp.element.Fragment,null,h(ProductRow,{row,onSaved,promoId,onPromo,canWrite,scope:context.scope,onAudit,onOpen,bulkSelection,onSelectBulk,open,onExpand:()=>setOpen(v=>!v)}),open&&row.type==='variable'&&h(wp.element.Fragment,null,
+ h('tr',{className:'sdd-child-tools'},h('td',{colSpan:7},h('div',{className:'sdd-child-toolbar'},h('strong',null,'ตัวเลือกสินค้า · '+row.name),h('span',null,all?'แสดงทั้งหมด — อาจอยู่นอกคำค้น/สถานะที่กรอง':'แสดงเฉพาะตัวเลือกที่ตรงคำค้น/ตัวกรอง'),h('button',{onClick:()=>{setAll(v=>!v);setPage(1);}},all?'แสดงเฉพาะที่ตรงตัวกรอง':'แสดงตัวเลือกทั้งหมด'),h('span',null,(busy||(!matches&&!error))?'กำลังโหลด…':matches?data.total+' ตัวเลือก':'ยังโหลดตัวเลือกไม่ได้'),h('button',{disabled:busy||page<=1,onClick:()=>setPage(v=>v-1),'aria-label':'ตัวเลือกก่อนหน้า #'+row.id},'←'),h('span',null,'หน้า '+page+' / '+Math.max(1,data.pages)),h('button',{disabled:busy||page>=data.pages,onClick:()=>setPage(v=>v+1),'aria-label':'ตัวเลือกถัดไป #'+row.id},'→'),h('select',{'aria-label':'จำนวนตัวเลือกต่อหน้า #'+row.id,value:size,onChange:e=>{setSize(Number(e.target.value));setPage(1);}},[20,50,100].map(n=>h('option',{key:n,value:n},n+' / หน้า')))),error&&h('div',null,h('p',{role:'alert',className:'sdd-error'},error),h('button',{type:'button',onClick:()=>setRetry(n=>n+1)},'โหลดตัวเลือกอีกครั้ง')))),
+ matches&&data.items.map(child=>h(ProductRow,{key:child.id,row:child,onSaved:saved,promoId,onPromo,canWrite:canWriteChild,scope:context.scope,onAudit,onOpen,bulkSelection,onSelectBulk})),matches&&!busy&&!error&&!data.items.length&&h('tr',null,h('td',{colSpan:7,className:'sdd-empty'},'ไม่พบตัวเลือกที่ตรงเงื่อนไข')),h('tr',{className:'sdd-child-footer'},h('td',{colSpan:7},h('span',null,'สิ้นสุดตัวเลือก · '+row.name),h('button',{'aria-label':'ปิดกลุ่มตัวเลือก #'+row.id,onClick:()=>setOpen(false)},'ยุบตัวเลือก')))));
 }
 function calendarWeeks(month,items){
  const [year,m]=month.split('-').map(Number),days=new Date(Date.UTC(year,m,0)).getUTCDate(),offset=new Date(Date.UTC(year,m-1,1)).getUTCDay();
@@ -737,7 +910,7 @@ function PromotionDuplicateChoice({row,other,busy,onKeep,onChooseAnother}){
   h('div',{className:'sdd-import-duplicate-grid'},card(other),card(row)),
   onChooseAnother&&h('button',{type:'button',disabled:busy,onClick:onChooseAnother},'เลือกสินค้าอื่น'));
 }
-function PromotionImportPicker({batch,row,rows,revision,onSelected,onClose}){
+function PromotionImportPicker({batch,row,rows,onSelect,onClose}){
  const [query,setQuery]=useState(row.input||row.name||''),[matches,setMatches]=useState(null),
   [error,setError]=useState(''),[busy,setBusy]=useState(false);
  const [duplicate,setDuplicate]=useState(null);
@@ -752,13 +925,13 @@ function PromotionImportPicker({batch,row,rows,revision,onSelected,onClose}){
  }
  async function select(id,replaceRow){
   setBusy(true);setError('');
-  try{onSelected(await api('promotion-import/'+batch+'/selection',{row:row.row,product_id:id,revision,...(replaceRow?{replace_row:replaceRow}:{})}),replaceRow||null);}
+  try{await onSelect({row:row.row,product_id:id,...(replaceRow?{replace_row:replaceRow}:{})},replaceRow||null);}
   catch(e){setError(e.message);}finally{setBusy(false);}
  }
  async function keep(number){
   if(number===row.row){await select(duplicate.id,duplicate.used_row);return;}
   setBusy(true);setError('');
-  try{onSelected(await api('promotion-import/'+batch+'/selection',{row:row.row,action:'remove',revision}),row.row);}
+  try{await onSelect({row:row.row,action:'remove'},row.row);}
   catch(e){setError(e.message);}finally{setBusy(false);}
  }
  const other=duplicate&&rows.find(entry=>entry.row===duplicate.used_row);
@@ -916,13 +1089,14 @@ function PromotionImport({onClose,onComplete,closeLabel='กลับปฏิ�
  const permanent=(preview?.mode||mode)==='permanent';
  const [selecting,setSelecting]=useState(null),[selectionNotice,setSelectionNotice]=useState('');
  const [rowDrafts,setRowDrafts]=useState({}),[expired,setExpired]=useState(false),[recovering,setRecovering]=useState(!!batch),[expiryWarning,setExpiryWarning]=useState(false),[errorRow,setErrorRow]=useState(null);
+ const [history,setHistory]=useState(null);
  const input=useRef(null),heading=useRef(null),matchedHeading=useRef(null),root=useRef(null);
  const engine=useRef({live:true,generation:0,busy:false,batch,preview:null,drafts:{},clock:null,expiryChecked:false});
  const state=engine.current;state.preview=preview;state.drafts=rowDrafts;
  const dirtyRows=Object.keys(rowDrafts).filter(number=>csvDraftDirty(rowDrafts[number]));
  const step=result?3:preview||batch?2:1;
  function focusHeading(){requestAnimationFrame(()=>heading.current?.focus());}
- function focusReview(){requestAnimationFrame(()=>{const target=matchedHeading.current||heading.current;target?.focus();});}
+ function focusReview(){requestAnimationFrame(()=>{const target=state.preview?.errors.length?heading.current:matchedHeading.current||heading.current;target?.focus();});}
  function focusRow(number,mode='input'){requestAnimationFrame(()=>{if(!state.live)return;const row=root.current?.querySelector('[data-import-row="'+number+'"]');const target=mode==='edit'?row?.querySelector('[data-import-edit]'):row?.querySelector('[aria-invalid="true"]')||row?.querySelector('input:not(:disabled)');target?.focus({preventScroll:true});target?.scrollIntoView?.({block:'nearest'});});}
  function commitDrafts(next){state.drafts=next;setRowDrafts(next);}
  function updateDraft(row,patch){
@@ -941,8 +1115,8 @@ function PromotionImport({onClose,onComplete,closeLabel='กลับปฏิ�
    commitDrafts({...state.drafts,[row.row]:{...draft,base:csvRowValues(row),identity:csvRowIdentity(row),conflict:false,missing:false}});
   }
  }
- function acceptReview(response,checked){
-  if(!response||typeof response.batch!=='string'||!Number.isInteger(response.revision)||!Array.isArray(response.rows)||!Array.isArray(response.errors)||!Number.isInteger(response.expires_at)||!Number.isInteger(response.server_time)||(state.batch&&response.batch!==state.batch))throw new ApiError({code:'invalid_response',message:'ยังอ่านชุดตรวจได้ไม่ครบ กรุณาลองตรวจสถานะอีกครั้ง'},502);
+ function acceptReview(response,checked,replacing=false){
+  if(!response||typeof response.batch!=='string'||!Number.isInteger(response.revision)||!Array.isArray(response.rows)||!Array.isArray(response.errors)||!Number.isInteger(response.expires_at)||!Number.isInteger(response.server_time)||(!replacing&&state.batch&&response.batch!==state.batch))throw new ApiError({code:'invalid_response',message:'ยังอ่านชุดตรวจได้ไม่ครบ กรุณาลองตรวจสถานะอีกครั้ง'},502);
   commitDrafts(mergeCsvDrafts(state.drafts,response,checked));state.preview=response;setPreview(response);
   if(response.expires_at&&response.server_time){state.clock={expiresAt:response.expires_at,deadline:importElapsedTime()+Math.max(0,response.expires_at-response.server_time)*1000};state.expiryChecked=false;}
   setExpired(false);setNeedsCheck(false);setProgress(null);setMode(response.mode||'temporary');
@@ -980,18 +1154,30 @@ function PromotionImport({onClose,onComplete,closeLabel='กลับปฏิ�
    if(!await confirmChange('การเลือกสินค้าและข้อมูลที่แก้ในชุดนี้จะถูกแทนที่ด้วยไฟล์ใหม่',{title:'เปลี่ยนไฟล์นำเข้า?',confirmLabel:'เลือกใช้ไฟล์ใหม่',cancelLabel:'กลับไปตรวจรายการ'}))return;
   }
   if(!state.live)return;
-  setSelectionNotice('');setSelecting(null);setEditing(null);setProgress(null);setResult(null);setFilename(file.name);setErrorRow(null);
-  remember('');state.preview=null;setPreview(null);commitDrafts({});setExpired(false);setExpiryWarning(false);state.clock=null;
   const token=begin('upload');if(!token)return;
   try{const payload=new FormData();payload.append('file',file);payload.append('mode',mode);
    const response=await api('promotion-import',payload);if(!current(token))return;
-   acceptReview(response);remember(response.batch||'');focusReview();
+   acceptReview(response,undefined,true);
+   setSelectionNotice('');setSelecting(null);setEditing(null);setResult(null);setFilename(file.name);setErrorRow(null);
+   commitDrafts({});setExpiryWarning(false);remember(response.batch);focusReview();
   }catch(error){if(current(token))setError(error.message);}finally{finish(token);}
  }
  function download(){
   const start=localMinute(Date.now()/1000+86400).replace('T',' '),end=localMinute(Date.now()/1000+172800).replace('T',' '),link=document.createElement('a');
   const csv=mode==='permanent'?'product_name,sale_price\r\nชื่อสินค้าเต็ม,3490\r\n':'product_name,sale_price,starts_at,ends_at\r\nชื่อสินค้าเต็ม,3490,'+start+','+end+'\r\n';
   link.href=URL.createObjectURL(new Blob(['\uFEFF'+csv],{type:'text/csv;charset=utf-8'}));link.download='sounddd-promotion-template.csv';link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);
+ }
+ function downloadIssues(){
+  const quote=value=>{
+   const text=String(value??'');
+   return '"'+(/^[\s]*[=+@-]|^[\t\r]/.test(text)?"'":'')+text.replace(/"/g,'""')+'"';
+  };
+  const rows=[['แถว','สินค้า','สิ่งที่ต้องแก้'],...(state.preview?.errors||[]).map(issue=>[issue.row,issue.name,issue.message])];
+  const link=document.createElement('a');
+  link.href=URL.createObjectURL(new Blob(['\uFEFF'+rows.map(row=>row.map(quote).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'}));
+  link.download='sounddd-csv-issues.csv';
+  link.click();
+  setTimeout(()=>URL.revokeObjectURL(link.href),1000);
  }
  function failed(error){
   setError(error.message);
@@ -1004,7 +1190,7 @@ function PromotionImport({onClose,onComplete,closeLabel='กลับปฏิ�
   const token=begin();if(!token)return null;if(restoring)setRecovering(true);
   try{const response=await api('promotion-import/'+token.batch);if(!current(token))return null;
    if(response.status==='completed')complete(response);
-   else if(response.status==='running'){setProgress(response);setMode(response.mode||'permanent');setEditing(null);setSelecting(null);setNeedsCheck(false);setExpired(false);state.clock=null;}
+   else if(['running','paused','needs_reconciliation'].includes(response.status)){setProgress(response);setMode(response.mode||'permanent');setEditing(null);setSelecting(null);setNeedsCheck(false);setExpired(false);state.clock=null;}
    else if(response.status==='ready'){acceptReview(response);focusReview();}
    else throw new ApiError({message:'ยังอ่านสถานะชุดนี้ไม่ได้ กรุณาลองตรวจอีกครั้ง',code:'invalid_response'},502);
    return response;
@@ -1015,9 +1201,23 @@ function PromotionImport({onClose,onComplete,closeLabel='กลับปฏิ�
   const token=begin('save');if(!token)return;
   try{const revision=progress?.revision??state.preview.revision;let response;
    do{response=await api('promotion-import/'+token.batch,{revision});if(!current(token))return;if(response.status==='running')setProgress(response);}while(response.status==='running');
+   if(['paused','needs_reconciliation'].includes(response.status)){setProgress(response);setNeedsCheck(false);return;}
    if(response.status!=='completed')throw new ApiError({message:'ยังยืนยันผลไม่ได้ กรุณาตรวจสถานะชุดเดิม',code:'invalid_response'},502);
    complete(response);
   }catch(error){if(current(token))failed(error);}finally{finish(token);}
+ }
+ async function loadHistory(){
+  const token=begin();if(!token)return;
+  try{const response=await api('promotion-import');if(current(token))setHistory(response.items||[]);}
+  catch(error){if(current(token))setError(error.message);}finally{finish(token);}
+ }
+ async function stopImport(){
+  const id=state.batch;
+  if(!await confirmChange('รายการที่บันทึกแล้วและแถวที่ต้องตรวจผลจะถูกเก็บไว้ ส่วนงานที่ยังไม่เริ่มจะหยุด', {title:'หยุดงานที่เหลือ?',confirmLabel:'ยืนยันหยุดงานที่เหลือ'}))return;
+  if(id!==state.batch)return;
+  const token=begin('save');if(!token)return;
+  try{const response=await api('promotion-import/'+id+'/stop',{confirmed:true});if(current(token))complete(response);}
+  catch(error){if(current(token))failed(error);}finally{finish(token);}
  }
  async function cancelImport(){
   if(state.busy||progress)return;
@@ -1041,7 +1241,7 @@ function PromotionImport({onClose,onComplete,closeLabel='กลับปฏิ�
   const token=begin('edit');if(!token)return;setErrorRow(null);
   try{const response=await api('promotion-import/'+token.batch+'/selection',{...input,revision:state.preview.revision});if(!current(token))return;
    acceptReview(response,input.values?input:undefined);setErrorRow(null);setSelecting(null);
-   if(input.action==='update'){if(!csvDraftDirty(state.drafts[input.row])){setEditing(null);focusRow(input.row,'edit');}setSelectionNotice('แถว '+input.row+' ตรวจแล้ว · ราคาสินค้าจะเปลี่ยนหลังยืนยันทั้งชุด');}
+   if(input.action==='update'){if(!csvDraftDirty(state.drafts[input.row])){setEditing(null);focusRow(input.row,'edit');}setSelectionNotice('แถว '+input.row+' ตรวจแล้ว · '+(permanent?'ราคาจะเปลี่ยนหลังยืนยันทั้งชุด':'ราคาจะเปลี่ยนเมื่อโปรเริ่ม'));}
    else if(input.action==='edit'){const issue=response.errors.find(entry=>entry.row===input.row);setSelectionNotice(issue?'แถว '+input.row+' · '+issue.message:'แถว '+input.row+' ผ่านแล้ว');if(issue)focusRow(input.row);else focusRow(input.row,'edit');}
    else setSelectionNotice(message);
   }catch(error){if(current(token)){setErrorRow(input.row);failed(error);focusRow(input.row);}}finally{finish(token);}
@@ -1050,11 +1250,9 @@ function PromotionImport({onClose,onComplete,closeLabel='กลับปฏิ�
  const removed=preview?.removed||[];
  const needsSelection=issues.filter(issue=>issue.selectable), corrections=issues.filter(issue=>issue.edit), fileIssues=issues.filter(issue=>!issue.selectable&&!issue.edit);
 
- const pickerFor=row=>selecting?.row===row.row&&h(PromotionImportPicker,{key:row.row,batch,row,rows,revision:preview.revision,
-  onClose:()=>setSelecting(null),onSelected:(response,removedRow)=>{
-   if(!state.live||response.batch!==state.batch)return;acceptReview(response);setSelecting(null);
-   setSelectionNotice(removedRow?'เอาแถว '+removedRow+' ออกจากชุดแล้ว':'แถว '+row.row+' เลือกสินค้าแล้ว');
-  }});
+ const pickerFor=row=>selecting?.row===row.row&&h(PromotionImportPicker,{key:row.row,batch,row,rows,
+  onClose:()=>setSelecting(null),onSelect:(input,removedRow)=>changeRow(input,
+   removedRow?'เอาแถว '+removedRow+' ออกจากชุดแล้ว':'แถว '+row.row+' เลือกสินค้าแล้ว')});
  const keepDuplicate=(issue,other,keep)=>{
   const remove=keep===issue.row?other.row:issue.row;
   const input=keep===issue.row?{row:keep,product_id:issue.id,replace_row:remove}:{row:remove,action:'remove'};
@@ -1084,9 +1282,15 @@ function PromotionImport({onClose,onComplete,closeLabel='กลับปฏิ�
   error&&h('p',{className:'sdd-error',role:'alert'},error),
   recovering&&h('p',{role:'status',className:'sdd-import-loading'},'กำลังเปิดชุดนำเข้าเดิม…'),
   busy&&!recovering&&h('p',{role:'status'},'กำลังตรวจข้อมูล…'),
+  !batch&&!result&&h('div',{className:'sdd-import-card'},
+   h('button',{type:'button',disabled:busy,onClick:loadHistory},'ดูชุดนำเข้าเดิม'),
+   history&&(history.length?h('ul',null,history.map(item=>h('li',{key:item.operation_id},
+    h('button',{type:'button',disabled:busy,onClick:()=>{remember(item.operation_id);inspect(true);}},
+     (item.status==='running'?'เปิดชุดที่ยังไม่จบ':item.status==='stopped'?'ดูชุดที่หยุดแล้ว':'ดูผลชุดเดิม')+' · '+(item.mode==='temporary'?'โปรชั่วคราว':'โปรถาวร')+(item.total?' · '+item.count+' / '+item.total:'')+(item.blocked_row?' · ตรวจแถว '+item.blocked_row:'')+' · '+displayDate(item.updated_at)+' · '+item.operation_id.slice(0,8))))):h('p',null,'ยังไม่มีชุดนำเข้าราคาโปรถาวร'))),
   result?h('div',{className:'sdd-import-card',role:'status'},
-   h('h2',null,result.mode==='permanent'?'บันทึกราคาโปรถาวรแล้ว '+result.count+' / '+result.total+' รายการ':'ตั้งโปรแล้ว '+result.count+' รายการ'),
+   h('h2',null,result.stopped?'หยุดงานที่เหลือแล้ว · บันทึกสำเร็จ '+result.count+' / '+result.total:result.mode==='permanent'?'บันทึกราคาโปรถาวรแล้ว '+result.count+' / '+result.total+' รายการ':'บันทึกแผนโปรแล้ว '+result.count+' รายการ'),
    result.mode==='permanent'?h(wp.element.Fragment,null,
+    result.stopped&&result.blocked&&h('p',null,'แถว '+result.blocked.row+' ยังต้องตรวจราคาปัจจุบัน',result.blocked.operation_id&&h('code',null,' · '+result.blocked.operation_id)),
     result.errors?.length>0&&h('ul',null,result.errors.map(issue=>h('li',{key:issue.row},'แถว '+issue.row+' · '+issue.name+' · '+issue.message))),
     h('button',{className:'sdd-primary',onClick:close},closeLabel)):
    h(wp.element.Fragment,null,h('p',null,'ราคาจะเปลี่ยนตามเวลาเริ่มของแต่ละรายการ'),
@@ -1102,7 +1306,7 @@ function PromotionImport({onClose,onComplete,closeLabel='กลับปฏิ�
     h('div',{className:'sdd-import-file-panel'},
      h('div',{className:'sdd-import-file-heading'},h('h3',null,'เตรียมไฟล์ CSV'),h('span',{className:'sdd-import-file-limit'},'สูงสุด 100 รายการ / ไฟล์')),
      h('ul',{className:'sdd-import-file-guide'},
-      h('li',null,h('strong',null,'สินค้าและราคา'),h('span',null,'หนึ่งแถวต่อสินค้า ใช้ชื่อเต็มหรือรหัสรุ่น และราคาเต็มบาท')),
+      h('li',null,h('strong',null,'สินค้าและราคา'),h('span',null,'หนึ่งแถวต่อสินค้า ใช้ชื่อเต็ม SKU ตรงตัว หรือรหัสรุ่น และราคาเต็มบาท')),
       mode==='temporary'&&h('li',null,h('strong',null,'วันเริ่มและวันสิ้นสุด'),h('span',null,h('code',null,'YYYY-MM-DD HH:mm'),' · ใช้ปี ค.ศ. เช่น 2026 · เวลาเว็บไซต์ '+(cfg.timezone||'UTC')))),
      h('div',{className:'sdd-import-file-footer'},h('div',null,h('strong',null,'เริ่มจากไฟล์ตัวอย่างได้'),h('p',null,'เลือกไฟล์แล้วจะเข้าสู่หน้าตรวจรายการ ยังไม่เปลี่ยนราคาสินค้า')),
       h('div',{className:'sdd-import-actions'},h('button',{type:'button',className:'sdd-secondary',onClick:download},'ดาวน์โหลดไฟล์ตัวอย่าง'),h('button',{type:'button',className:'sdd-primary',disabled:busy,onClick:()=>input.current.click()},'เลือกไฟล์ CSV'))))),
@@ -1110,11 +1314,12 @@ function PromotionImport({onClose,onComplete,closeLabel='กลับปฏิ�
     h('span',{className:'sdd-import-recovery-icon','aria-hidden':true},'↻'),
     h('div',null,h('h2',null,'ตรวจสถานะชุดเดิม'),h('p',null,'พบชุดนำเข้าที่เปิดไว้ก่อนหน้า หรือยังไม่ได้รับผลตอบกลับครบถ้วน'),
      h('ul',null,h('li',null,'ลองตรวจสถานะอีกครั้งเพื่อเปิดรายการล่าสุดหรือดูผลบันทึก'),h('li',null,'ยกเลิกได้เฉพาะชุดที่ยังไม่เริ่มบันทึก ระบบจะตรวจให้อีกครั้งก่อนยกเลิก')))),
-   progress&&h('div',{className:'sdd-import-progress-card',role:'status'},h('h2',null,'ชุดนี้เริ่มบันทึกแล้ว'),h('p',null,'บันทึกราคาโปรถาวรแล้ว '+progress.count+' รายการ · ตรวจผล '+progress.processed+' / '+progress.total),h('p',null,'กดทำรายการที่เหลือต่อ โดยใช้คำสั่งชุดเดิม')),
+   progress&&h('div',{className:'sdd-import-progress-card',role:'status'},h('h2',null,'ชุดนี้เริ่มบันทึกแล้ว'),h('p',null,'บันทึกราคาโปรถาวรแล้ว '+progress.count+' รายการ · ตรวจผล '+progress.processed+' / '+progress.total),progress.status==='needs_reconciliation'?h('p',null,'แถว '+progress.blocked?.row+' ยังยืนยันผลไม่ได้',progress.blocked?.operation_id&&h('code',null,' · '+progress.blocked.operation_id)):
+    h('p',null,progress.status==='paused'?'ระบบพักการบันทึก งานที่ยังไม่เริ่มจะรอจนเปิดให้บันทึก':'กดทำรายการที่เหลือต่อ โดยใช้คำสั่งชุดเดิม')),
    preview&&!progress&&h('div',{className:'sdd-import-card'},
     h('h2',null,permanent?'ตรวจราคาโปรถาวร':'ตรวจรายการ'),h('p',null,(filename||'ผลตรวจที่บันทึกไว้')+' · '+preview.total+' รายการ · '+(cfg.timezone||'UTC')),
-    h('div',{className:'sdd-import-summary'},h('strong',null,'ผ่าน '+rows.length),h('strong',null,'ต้องจัดการ '+issues.length),removed.length>0&&h('span',null,'เอาออก '+removed.length+' แถว')),
-    h('p',{className:'sdd-import-save-help'},permanent?'ราคาสินค้าจะเปลี่ยนหลังยืนยันทั้งชุด · ราคาใหม่ใช้ทันทีและล้างวันโปรเดิม':'ราคาสินค้าจะเปลี่ยนหลังยืนยันทั้งชุด · ช่องวันเวลาใช้ปี ค.ศ. เช่น 2026'),
+    h('div',{className:'sdd-import-summary'},h('strong',null,'ผ่าน '+rows.length),h('strong',null,'ต้องจัดการ '+issues.length),removed.length>0&&h('span',null,'เอาออก '+removed.length+' แถว'),issues.length>0&&h('button',{type:'button',onClick:downloadIssues},'ดาวน์โหลดรายการที่ต้องแก้')),
+    h('p',{className:'sdd-import-save-help'},permanent?'ราคาสินค้าจะเปลี่ยนหลังยืนยันทั้งชุด · ราคาใหม่ใช้ทันทีและล้างวันโปรเดิม':'หลังยืนยันจะบันทึกแผนโปร ราคาเปลี่ยนเมื่อโปรเริ่ม · ช่องวันเวลาใช้ปี ค.ศ. เช่น 2026'),
     rows.length>0&&h(ImportPriceSummary,{rows,permanent}),
     dirtyRows.length>0&&h('p',{role:'status'},'มีค่าที่ยังไม่ได้ตรวจ '+dirtyRows.length+' แถว · ตรวจแถวนี้ก่อนยืนยันทั้งชุด'),
     editing!==null&&h('p',null,'กำลังแก้แถว '+editing+' · กดตรวจแถวนี้ หรือยกเลิกการแก้แถว'),
@@ -1165,14 +1370,16 @@ function PromotionImport({onClose,onComplete,closeLabel='กลับปฏิ�
    expired&&h('div',{className:'sdd-import-expired',role:'status'},h('strong',null,'ชุดตรวจหมดอายุแล้ว'),h('p',null,preview?'ยังเก็บข้อมูลที่เห็นไว้ให้อ่านหรือคัดลอก กรุณาเลือกไฟล์ใหม่ก่อนยืนยัน':'กรุณาอัปโหลดไฟล์ใหม่เพื่อเริ่มตรวจอีกครั้ง'),h('button',{type:'button',disabled:busy,onClick:()=>input.current.click()},'เลือกไฟล์ใหม่')),
    (expired||result||progress)&&dirtyRows.length>0&&h('details',{className:'sdd-import-local-values',open:true},h('summary',null,'ค่าที่ยังไม่ตรวจ (ยังไม่ได้บันทึก)'),dirtyRows.map(number=>h('div',{key:number},h('strong',null,'แถว '+number+' · '+rowDrafts[number].name),h('pre',null,JSON.stringify(rowDrafts[number].values,null,2)))),progress&&h('p',null,'ค่าที่ยังไม่ตรวจไม่ได้รวมในชุดที่เริ่มบันทึกแล้ว'),progress&&h('button',{type:'button',onClick:()=>commitDrafts({})},'รับทราบและไม่ใช้ค่าที่ยังไม่ตรวจ')),
    h('div',{className:'sdd-import-actions sdd-import-footer'},
-    h('div',{className:'sdd-import-footer-secondary'},h('button',{type:'button',disabled:busy,onClick:close},closeLabel),
+    h('div',{className:'sdd-import-footer-secondary'},h('button',{type:'button',disabled:busy,onClick:close},closeLabel),progress&&h('button',{type:'button',disabled:busy,onClick:async()=>{if(await askLeave())resetImport();}},'เก็บชุดนี้ไว้และกลับไปหน้านำเข้า'),
     preview&&!progress&&!result&&preview.expires_at&&h('div',{className:'sdd-import-expiry'},h('span',null,expired?'ชุดตรวจหมดอายุแล้ว':'เก็บชุดนี้ไว้ถึง ',!expired&&h('time',{dateTime:new Date(preview.expires_at*1000).toISOString()},displayDate(preview.expires_at,'time')),!expired&&' น.'),expiryWarning&&!expired&&h('p',{role:'status'},'เหลือเวลาไม่เกิน 5 นาที'))),
     h('div',{className:'sdd-import-footer-main'},
      (preview||batch)&&h('button',{type:'button',className:'sdd-import-cancel',disabled:busy||recovering||!!progress,onClick:cancelImport,title:progress?'ชุดนี้เริ่มบันทึกแล้ว กรุณาตรวจผลคำสั่งเดิม':'ยกเลิกชุดตรวจนี้และกลับไปเลือกไฟล์ใหม่'},'ยกเลิกชุดนี้'),
     preview&&!progress&&!needsCheck&&!fileIssues.length&&h('button',{disabled:busy||expired||needsCheck||!!selecting||editing!==null||dirtyRows.length>0,onClick:()=>input.current.click()},'เปลี่ยนไฟล์'),
     !progress&&rows.length>0&&h('button',{type:'button',onClick:()=>matchedHeading.current?.focus()},'ดูรายการสินค้า ('+rows.length+')'),
     needsCheck?h('button',{className:'sdd-primary',disabled:busy||recovering,onClick:()=>inspect(false)},'ตรวจสถานะชุดเดิม'):
-    progress?h('button',{className:'sdd-primary',disabled:busy||dirtyRows.length>0,onClick:confirm},'ทำรายการที่เหลือต่อ'):
+    progress?h(wp.element.Fragment,null,
+     h('button',{className:'sdd-primary',disabled:busy||dirtyRows.length>0,onClick:confirm},progress.status==='needs_reconciliation'?'ตรวจผลเดิมและทำต่อ':'ทำรายการที่เหลือต่อ'),
+     progress.status==='needs_reconciliation'&&h('button',{type:'button',disabled:busy,onClick:stopImport},'หยุดงานที่เหลือ')):
     (preview||batch)&&h('button',{className:'sdd-primary',disabled:busy||expired||dirtyRows.length>0||!batch||!preview||!rows.length||!!issues.length||!!selecting||editing!==null,onClick:confirm},preview?(permanent?'ยืนยันเปลี่ยนราคา ':'ยืนยันตั้งโปร ')+(removed.length?rows.length:preview.total)+' รายการ':'ลองยืนยันชุดเดิมอีกครั้ง')))));
 }
 function PromotionCalendar({onClose,onProduct,tick,month:controlledMonth,onMonthChange,options={},onOptions}){
@@ -1182,16 +1389,21 @@ function PromotionCalendar({onClose,onProduct,tick,month:controlledMonth,onMonth
  const month=controlledMonth||fallbackMonth,setMonth=onMonthChange||setFallbackMonth;
  const [localSelected,setLocalSelected]=useState(month===today.slice(0,7)?today:month+'-01'),[data,setData]=useState(null),[error,setError]=useState(''),[busy,setBusy]=useState(false);
  const selected=options.calendarSelected||localSelected,setSelected=value=>onOptions?onOptions({calendarSelected:value}):setLocalSelected(value);
- useEffect(()=>{let current=true;setBusy(true);setError('');setData(null);api('promotion-calendar?'+new URLSearchParams({month})).then(r=>{if(current)setData(r);}).catch(e=>{if(current)setError(e.message);}).finally(()=>{if(current)setBusy(false);});return()=>{current=false;};},[month,tick,importTick]);
+
  useEffect(()=>{if(selected.slice(0,7)!==month)setSelected(month+'-01');},[month]);
  const [year,m]=month.split('-').map(Number),first=new Date(Date.UTC(year,m-1,1)),days=new Date(Date.UTC(year,m,0)).getUTCDate(),offset=first.getUTCDay();
  const monthName=new Intl.DateTimeFormat('th-TH',{timeZone:'UTC',month:'long',year:'numeric'}).format(first);
- const shift=delta=>{const next=new Date(Date.UTC(year,m-1+delta,1));const value=next.getUTCFullYear()+'-'+String(next.getUTCMonth()+1).padStart(2,'0');setMonth(value);setSelected(value+'-01');};
+ const shift=delta=>{setCalendarPage(1);setDayOnly(false);const next=new Date(Date.UTC(year,m-1+delta,1));const value=next.getUTCFullYear()+'-'+String(next.getUTCMonth()+1).padStart(2,'0');setMonth(value);setSelected(value+'-01');};
  const applies=(item,day)=>datePart(String(item.starts_at))<=day&&datePart(String(item.ends_at))>=day;
  const [localSearch,setLocalSearch]=useState(''),[localStatus,setLocalStatus]=useState(''),[localView,setLocalView]=useState('month');
+ const [calendarPage,setCalendarPage]=useState(1),[dayOnly,setDayOnly]=useState(false);
  const calendarSearch=options.calendarSearch??localSearch,calendarStatus=options.calendarStatus??localStatus,calendarView=options.calendarView||localView;
  const setCalendarSearch=value=>onOptions?onOptions({calendarSearch:value}):setLocalSearch(value),setCalendarStatus=value=>onOptions?onOptions({calendarStatus:value}):setLocalStatus(value),setCalendarView=value=>onOptions?onOptions({calendarView:value}):setLocalView(value);
- const items=(data?.items||[]).filter(item=>(!calendarStatus||item.status===calendarStatus)&&(!calendarSearch||(item.name+' '+item.id+' '+(item.sku||'')).toLocaleLowerCase().includes(calendarSearch.toLocaleLowerCase()))),selectedItems=items.filter(item=>applies(item,selected));
+ useEffect(()=>{let current=true;setBusy(true);setError('');setData(null);
+  const timer=setTimeout(()=>api('promotion-calendar?'+new URLSearchParams({month,search:calendarSearch.trim(),status:calendarStatus,page:String(calendarPage),...(dayOnly&&selected.slice(0,7)===month?{day:selected}:{})})).then(r=>{if(current)setData(r);}).catch(e=>{if(current)setError(e.message);}).finally(()=>{if(current)setBusy(false);}),250);
+  return()=>{current=false;clearTimeout(timer);};
+ },[month,tick,importTick,calendarSearch,calendarStatus,calendarPage,dayOnly,dayOnly?selected:'']);
+ const items=data?.items||[],selectedItems=items.filter(item=>applies(item,selected));
  const eventLabel=(item,day)=>{const start=datePart(String(item.starts_at))===day,end=datePart(String(item.ends_at))===day;return start&&end?'กำหนดเริ่มและจบ':start?'กำหนดเริ่ม':end?'กำหนดจบ':'อยู่ในช่วงที่ตั้งไว้';};
  if(importing)return h(PromotionImport,{onClose:()=>{setImporting(false);requestAnimationFrame(()=>document.getElementById('sdd-import-trigger')?.focus());},onComplete:start=>{
   const day=datePart(String(start));setMonth(day.slice(0,7));
@@ -1199,14 +1411,19 @@ function PromotionCalendar({onClose,onProduct,tick,month:controlledMonth,onMonth
   else{setLocalSearch('');setLocalStatus('');setLocalSelected(day);}
   setImportTick(t=>t+1);setImporting(false);
  }});
- return h('section',{className:'sdd-promo-calendar'},h('div',{className:'sdd-calendar-page-head'},h('div',null,h('span',{className:'sdd-dashboard-eyebrow'},'วางแผนโปรโมชัน'),h('h1',null,'ปฏิทินโปรชั่วคราว'),h('p',null,'เฉพาะโปรชั่วคราวในปลั๊กอินนี้ · 1 รายการคือสินค้า หรือตัวเลือกสินค้า 1 ตัว')),h('div',{className:'sdd-import-actions'},cfg.canImportPromotions&&h('button',{id:'sdd-import-trigger',className:'sdd-primary',onClick:()=>setImporting(true)},'นำเข้าโปรจาก CSV'),h('button',{onClick:onClose},'← กลับไปจัดการสินค้า'))),
- h('div',{className:'sdd-calendar-filters'},h('label',null,'ค้นหาโปร',h('input',{value:calendarSearch,onChange:e=>setCalendarSearch(e.target.value),placeholder:'ชื่อสินค้า, SKU หรือ ID'})),h('label',null,'สถานะปัจจุบัน',h('select',{value:calendarStatus,onChange:e=>setCalendarStatus(e.target.value)},h('option',{value:''},'ทุกสถานะ'),Object.entries(promoLabels).map(([id,label])=>h('option',{key:id,value:id},label)))),h('div',{className:'sdd-view-switch'},[['month','เดือน'],['list','รายการ']].map(([id,label])=>h('button',{key:id,'aria-pressed':calendarView===id,onClick:()=>setCalendarView(id)},label)))),
- h('div',{className:'sdd-calendar-layout'},h('section',{className:'sdd-calendar-card'},h('div',{className:'sdd-calendar-toolbar'},h('button',{onClick:()=>shift(-1),disabled:month==='2000-01','aria-label':'เดือนก่อนหน้า'},'←'),h('h2',{'aria-live':'polite'},monthName),h('button',{onClick:()=>shift(1),disabled:month==='2099-12','aria-label':'เดือนถัดไป'},'→'),h('button',{onClick:()=>{setMonth(today.slice(0,7));setSelected(today);}},'วันนี้')),
+ return h('section',{className:'sdd-promo-calendar'},h('div',{className:'sdd-calendar-page-head'},h('div',null,h('span',{className:'sdd-dashboard-eyebrow'},'วางแผนโปรโมชัน'),h('h1',{id:'sdd-calendar-title',tabIndex:-1},'ปฏิทินโปรชั่วคราว'),h('p',null,'เฉพาะโปรชั่วคราวในปลั๊กอินนี้ · 1 รายการคือสินค้า หรือตัวเลือกสินค้า 1 ตัว')),h('div',{className:'sdd-import-actions'},cfg.canImportPromotions&&h('button',{id:'sdd-import-trigger',className:'sdd-primary',onClick:()=>setImporting(true)},'นำเข้าโปรจาก CSV'),h('button',{onClick:onClose},'← กลับไปจัดการสินค้า'))),
+ h('div',{className:'sdd-calendar-filters'},h('label',null,'ค้นหาโปร',h('input',{value:calendarSearch,onChange:e=>{setCalendarPage(1);setCalendarSearch(e.target.value);},maxLength:200,placeholder:'ชื่อสินค้า, SKU หรือ ID'})),h('label',null,'สถานะปัจจุบัน',h('select',{value:calendarStatus,onChange:e=>{setCalendarPage(1);setCalendarStatus(e.target.value);}},h('option',{value:''},'ทุกสถานะ'),Object.entries(promoLabels).map(([id,label])=>h('option',{key:id,value:id},label)))),h('div',{className:'sdd-view-switch'},[['month','เดือน'],['list','รายการ']].map(([id,label])=>h('button',{key:id,'aria-pressed':calendarView===id,onClick:()=>{if(id==='month'){setDayOnly(false);setCalendarPage(1);}setCalendarView(id);}},label)))),
+ h('div',{className:'sdd-calendar-layout'},h('section',{className:'sdd-calendar-card'},h('div',{className:'sdd-calendar-toolbar'},h('button',{onClick:()=>shift(-1),disabled:month==='2000-01','aria-label':'เดือนก่อนหน้า'},'←'),h('h2',{'aria-live':'polite'},monthName),h('button',{onClick:()=>shift(1),disabled:month==='2099-12','aria-label':'เดือนถัดไป'},'→'),h('button',{onClick:()=>{setCalendarPage(1);setDayOnly(false);setMonth(today.slice(0,7));setSelected(today);}},'วันนี้')),
  h('p',{className:'sdd-calendar-note'},'เวลาตามเว็บไซต์ '+(cfg.timezone||'UTC')+' · วันในปฏิทินเป็นช่วงที่ตั้งไว้ สถานะบอกผลล่าสุด'),h('div',{className:'sdd-calendar-legend'},[['pending','รอเริ่ม'],['active','กำลังใช้'],['needs_review','ต้องตรวจสอบ / เลยเวลาเริ่ม'],['restored','สิ้นสุด / ปิดแล้ว']].map(([key,label])=>h('span',{key},h('i',{className:'sdd-calendar-dot '+key,'aria-hidden':true}),label))),
- busy&&h('p',{role:'status'},'กำลังโหลดปฏิทิน…'),error&&h('p',{className:'sdd-error',role:'alert'},error),data?.limited&&h('p',{className:'sdd-dashboard-limit'},'แสดงจาก 200 โปรแรกในเดือนนี้ ยังมีรายการอื่นที่ไม่ได้แสดง'),
- h('div',{className:'sdd-month-view'+(calendarView==='list'?' is-hidden':'')},h(CalendarMonth,{month,items,selected,today,busy,error,onSelect:setSelected,onList:()=>setCalendarView('list')}))),
- h('section',{className:'sdd-month-agenda'+(calendarView==='list'?' is-visible':''),'aria-label':'รายการโปรในเดือน'},h('h2',null,'รายการโปร · '+monthName),busy?h('p',{role:'status'},'กำลังโหลด…'):error?h('p',null,'อ่านรายการไม่ได้ กรุณารีเฟรช'):!items.length?h('p',null,'ไม่พบโปรที่ตรงเงื่อนไขในเดือนนี้'):h('ul',null,items.map(item=>h('li',{key:item.promotion_id},h('span',{className:'sdd-status '+item.status},promoLabels[item.status]||item.status),h('button',{className:'sdd-calendar-product',onClick:()=>onProduct(item.id)},item.name),h('p',null,'ราคาโปร '+showValue(item.price,'sale_price')+' บาท'),h('small',null,promoTime(item.starts_at)+' → '+promoTime(item.ends_at)))))),
- h('section',{className:'sdd-calendar-details'},h('h2',null,'โปรวันที่ '+displayDate(selected,'date')),h('p',{className:'sdd-calendar-note'},'กดชื่อสินค้าเพื่อเปิดในตารางจัดการ'),busy?h('p',null,'กำลังโหลด…'):error?h('p',null,'ไม่สามารถแสดงรายการได้'):selectedItems.length?h('ul',null,selectedItems.map(item=>h('li',{key:item.promotion_id},h('span',{className:'sdd-calendar-detail-event'},eventLabel(item,selected)),h('span',{className:'sdd-status '+item.status},promoLabels[item.status]||item.status),h('button',{className:'sdd-calendar-product',onClick:()=>onProduct(item.id)},item.name),h('small',null,'#'+item.id+(item.sku?' · '+item.sku:'')),h('p',null,'ราคาโปร '+showValue(item.price,'sale_price')+' บาท'),h('small',null,'กำหนด '+promoTime(item.starts_at)+' → '+promoTime(item.ends_at)),item.message&&h('p',{className:'sdd-calendar-message'+(['needs_review','missed'].includes(item.status)?' is-attention':'')},item.message)))):h('p',{className:'sdd-dashboard-empty'},'ไม่มีโปรในวันที่เลือก'),h('p',{className:'sdd-calendar-note'},'วันเริ่มและสิ้นสุดเป็นเวลาที่ตั้งไว้ สถานะบอกผลล่าสุด'))));
+ busy&&h('p',{role:'status'},'กำลังโหลดปฏิทิน…'),error&&h('p',{className:'sdd-error',role:'alert'},error),(calendarPage>1||data?.limited)&&h('div',{className:'sdd-calendar-toolbar'},
+  h('button',{type:'button',disabled:busy||calendarPage===1,onClick:()=>setCalendarPage(n=>n-1)},'โปรหน้าก่อน'),
+  h('span',null,'หน้าที่ '+calendarPage),
+  h('button',{type:'button',disabled:busy||!data?.limited,onClick:()=>setCalendarPage(n=>n+1)},'โปรหน้าถัดไป')),
+ h('div',{className:'sdd-month-view'+(calendarView==='list'?' is-hidden':'')},h(CalendarMonth,{month,items,selected,today,busy,error,onSelect:day=>{setSelected(day);setCalendarPage(1);setDayOnly(true);setCalendarView('list');},onList:()=>setCalendarView('list')}))),
+ h('section',{className:'sdd-month-agenda'+(calendarView==='list'?' is-visible':''),'aria-label':'รายการโปรในเดือน'},h('h2',null,'รายการโปร · '+monthName),
+ h('div',{className:'sdd-calendar-filters'},h('label',null,'เลือกวัน',h('input',{type:'date',value:selected,onChange:e=>{const day=e.target.value;if(!day)return;setCalendarPage(1);setMonth(day.slice(0,7));setSelected(day);setDayOnly(true);}})),dayOnly&&h('button',{type:'button',onClick:()=>{setCalendarPage(1);setDayOnly(false);}},'ดูทุกวันในเดือน')),
+ dayOnly&&!selectedItems.length&&items.length>0&&h('p',null,data?.limited?'ขณะนี้แสดงผลเพียงบางหน้า':'ไม่มีโปรในวันที่เลือก'),busy?h('p',{role:'status'},'กำลังโหลด…'):error?h('p',null,'อ่านรายการไม่ได้ กรุณารีเฟรช'):!items.length?h('p',null,data?.limited?'ยังตรวจไม่ครบทุกโปรในเดือนนี้':'ไม่พบโปรที่ตรงเงื่อนไขในเดือนนี้'):h('ul',null,(dayOnly?selectedItems:items).map(item=>h('li',{key:item.promotion_id},h('span',{className:'sdd-status '+item.status},promoLabels[item.status]||item.status),h('button',{className:'sdd-calendar-product','data-calendar-product':item.id,onClick:()=>onProduct(item.id)},item.name),h('small',null,item.sku||'#'+item.id),h('p',null,'ราคาโปร '+showValue(item.price,'sale_price')+' บาท'),h('small',null,promoTime(item.starts_at)+' → '+promoTime(item.ends_at)),['needs_review','missed'].includes(item.status)&&item.message&&h('p',null,item.message))))),
+ h('section',{className:'sdd-calendar-details'},h('h2',null,'โปรวันที่ '+displayDate(selected,'date')),h('p',{className:'sdd-calendar-note'},'กดชื่อสินค้าเพื่อเปิดในตารางจัดการ'),busy?h('p',null,'กำลังโหลด…'):error?h('p',null,'ไม่สามารถแสดงรายการได้'):selectedItems.length?h('ul',null,selectedItems.map(item=>h('li',{key:item.promotion_id},h('span',{className:'sdd-calendar-detail-event'},eventLabel(item,selected)),h('span',{className:'sdd-status '+item.status},promoLabels[item.status]||item.status),h('button',{className:'sdd-calendar-product',onClick:()=>onProduct(item.id)},item.name),h('small',null,'#'+item.id+(item.sku?' · '+item.sku:'')),h('p',null,'ราคาโปร '+showValue(item.price,'sale_price')+' บาท'),h('small',null,'กำหนด '+promoTime(item.starts_at)+' → '+promoTime(item.ends_at)),item.message&&h('p',{className:'sdd-calendar-message'+(['needs_review','missed'].includes(item.status)?' is-attention':'')},item.message)))):h('p',{className:'sdd-dashboard-empty'},data?.limited?'ยังตรวจไม่ครบทุกโปรในวันที่เลือก':'ไม่มีโปรในวันที่เลือก'),h('p',{className:'sdd-calendar-note'},'วันเริ่มและสิ้นสุดเป็นเวลาที่ตั้งไว้ สถานะบอกผลล่าสุด'))));
 }
 function DashboardGroup({title,subtitle,group,render,empty,tone='blue',wide=false}){
  const [visible,setVisible]=useState(5);
@@ -1216,17 +1433,18 @@ function DashboardGroup({title,subtitle,group,render,empty,tone='blue',wide=fals
   group.limited&&h('p',{className:'sdd-dashboard-limit'},'แสดงสูงสุด 100 รายการแรก ยังมีรายการอื่นที่ไม่ได้แสดง'),
   total?h(wp.element.Fragment,null,h('ul',{className:'sdd-dashboard-list'},group.items.slice(0,visible).map(render)),visible<total&&h('button',{className:'sdd-dashboard-more',onClick:()=>setVisible(n=>Math.min(n+10,total))},'แสดงเพิ่มอีก '+Math.min(10,total-visible)+' รายการ'),visible>5&&h('button',{className:'sdd-dashboard-more',onClick:()=>setVisible(5)},'ย่อรายการ')):h('p',{className:'sdd-dashboard-empty'},h('span',{'aria-hidden':true},'✓'),group.limited?'ไม่พบรายการที่มีสิทธิ์ดูใน 100 รายการแรก':empty));
 }
-function DashboardTasks({data,onProduct,date,selectedTab,onTabChange}){
+function DashboardTasks({data,onProduct,onAudit,date,selectedTab,onTabChange}){
  const [localTab,setLocalTab]=useState('problems'),[visible,setVisible]=useState(10);
  const tab=selectedTab||localTab,setTab=value=>{setLocalTab(value);onTabChange?.(value);};
  const groups={problems:data.problems.items.map(item=>({...item,kind:'problems',label:'ต้องตรวจสอบ',detail:item.message})),upcoming:data.upcoming.items.map(item=>({...item,kind:'upcoming',label:item.event_type==='start'?'ใกล้เริ่ม':'ใกล้จบ',detail:(item.event_type==='start'?'กำหนดเริ่ม ':'กำหนดจบ ')+date(item.at)})),changes:data.changes.items.map(item=>({...item,kind:'changes',label:'ราคาลดลง',detail:(labels[item.field]||item.field)+' '+displayPrice(item.old_value)+' → '+displayPrice(item.new_value)+' บาท · '+date(item.at)}))};
  const rows=tab==='all'?Object.values(groups).flat():groups[tab];
- return h('section',{className:'sdd-task-board',id:'sdd-task-board'},h('div',{className:'sdd-task-board-heading'},h('div',null,h('span',{className:'sdd-dashboard-eyebrow'},'ติดตามและดำเนินการ'),h('h2',null,'รายการงานของร้าน')),h('span',{className:'sdd-task-total'},rows.length+' รายการที่โหลดได้')),
+ const open=item=>item.kind==='changes'&&onAudit&&item.event_id?onAudit(item.id,item.field,item.event_id):onProduct(item.id);
+ return h('section',{className:'sdd-task-board',id:'sdd-task-board',tabIndex:-1},h('div',{className:'sdd-task-board-heading'},h('div',null,h('span',{className:'sdd-dashboard-eyebrow'},'ติดตามและดำเนินการ'),h('h2',null,'รายการงานของร้าน')),h('span',{className:'sdd-task-total'},rows.length+' รายการที่โหลดได้')),
  h('div',{className:'sdd-task-tabs','aria-label':'ประเภทงาน'},[['problems','ต้องตรวจสอบ'],['upcoming','ใกล้เริ่ม / จบ'],['changes','ราคาลดลง'],['all','ทั้งหมด']].map(([id,label])=>h('button',{key:id,'aria-pressed':tab===id,onClick:()=>{setTab(id);setVisible(10);}},label,h('span',null,id==='all'?Object.values(groups).flat().length:groups[id].length)))),
  Object.entries({problems:data.problems,upcoming:data.upcoming,changes:data.changes}).some(([key,group])=>group.limited&&(tab==='all'||tab===key))&&h('p',{className:'sdd-dashboard-limit'},'ข้อมูลแต่ละประเภทแสดงไม่เกิน 100 รายการแรก ตัวเลขนี้ไม่ใช่ยอดทั้งหมด'),
- !rows.length?h('div',{className:'sdd-task-empty'},h('span',{'aria-hidden':true},'✓'),h('strong',null,'ไม่มีรายการในหมวดนี้'),h('p',null,'เลือกหมวดอื่นหรือปรับช่วงเวลาที่ต้องการดู')):h('div',{className:'sdd-task-table-wrap'},h('table',{className:'sdd-task-table'},h('thead',null,h('tr',null,['สินค้า','สถานะงาน','รายละเอียด','ดำเนินการ'].map(label=>h('th',{key:label,scope:'col'},label)))),h('tbody',null,rows.slice(0,visible).map((item,index)=>h('tr',{key:item.kind+':'+item.id+':'+index},h('td',{'data-label':'สินค้า'},h('button',{className:'sdd-dashboard-product',onClick:()=>onProduct(item.id)},item.name),h('small',null,'#'+item.id+(item.sku?' · '+item.sku:''))),h('td',{'data-label':'สถานะงาน'},h('span',{className:'sdd-task-badge '+item.kind},item.label)),h('td',{'data-label':'รายละเอียด'},item.detail),h('td',{'data-label':'ดำเนินการ'},h('button',{className:'sdd-task-action',onClick:()=>onProduct(item.id)},item.kind==='problems'?'ตรวจสอบโปร →':'เปิดสินค้า →'))))))),visible<rows.length&&h('button',{className:'sdd-dashboard-more',onClick:()=>setVisible(n=>n+10)},'แสดงเพิ่มอีก '+Math.min(10,rows.length-visible)+' รายการ'));
+ !rows.length?h('div',{className:'sdd-task-empty'},h('span',{'aria-hidden':true},'✓'),h('strong',null,'ไม่มีรายการในหมวดนี้'),h('p',null,'เลือกหมวดอื่นหรือปรับช่วงเวลาที่ต้องการดู')):h('div',{className:'sdd-task-table-wrap'},h('table',{className:'sdd-task-table'},h('thead',null,h('tr',null,['สินค้า','สถานะงาน','รายละเอียด','ดำเนินการ'].map(label=>h('th',{key:label,scope:'col'},label)))),h('tbody',null,rows.slice(0,visible).map((item,index)=>h('tr',{key:item.kind+':'+item.id+':'+index,'data-task-product':item.id},h('td',{'data-label':'สินค้า'},h('button',{className:'sdd-dashboard-product',onClick:()=>onProduct(item.id)},item.name),h('small',null,'#'+item.id+(item.sku?' · '+item.sku:''))),h('td',{'data-label':'สถานะงาน'},h('span',{className:'sdd-task-badge '+item.kind},item.label)),h('td',{'data-label':'รายละเอียด'},item.detail),h('td',{'data-label':'ดำเนินการ'},h('button',{className:'sdd-task-action',onClick:()=>open(item)},item.kind==='problems'?'ตรวจสอบโปร →':item.kind==='changes'&&onAudit&&item.event_id?'ดูเหตุการณ์ราคา →':'เปิดสินค้า →'))))))),visible<rows.length&&h('button',{className:'sdd-dashboard-more',onClick:()=>setVisible(n=>n+10)},'แสดงเพิ่มอีก '+Math.min(10,rows.length-visible)+' รายการ'));
 }
-function Dashboard({onClose,onProduct,onSettings,tick,options={},onOptions}){
+function Dashboard({onClose,onProduct,onSettings,onAudit,tick,options={},onOptions}){
  const [localHours,setLocalHours]=useState('24'),[localThreshold,setLocalThreshold]=useState('30'),[data,setData]=useState(null),[error,setError]=useState(''),[busy,setBusy]=useState(false);
  const hours=options.dashboardHours||localHours,threshold=options.dashboardThreshold||localThreshold;
  const setHours=value=>onOptions?onOptions({dashboardHours:value}):setLocalHours(value),setThreshold=value=>onOptions?onOptions({dashboardThreshold:value}):setLocalThreshold(value);
@@ -1237,9 +1455,9 @@ function Dashboard({onClose,onProduct,onSettings,tick,options={},onOptions}){
  return h('section',{className:'sdd-dashboard'},h('div',{className:'sdd-dashboard-heading'},h('div',null,h('span',{className:'sdd-dashboard-eyebrow'},'ภาพรวมร้าน'),h('h1',null,'งานที่ต้องจัดการ'),h('p',null,'ดูรายการที่ควรติดตาม แล้วกดชื่อสินค้าเพื่อจัดการต่อ')),h('button',{className:'sdd-dashboard-back',onClick:onClose},'← กลับไปจัดการสินค้า')),
  h('div',{className:'sdd-dashboard-controls'},h('div',{className:'sdd-dashboard-controls-title'},h('strong',null,'เลือกสิ่งที่ต้องการดู'),h('span',null,'เลือกช่วงเวลาและระดับการลดราคา')),h('label',null,h('span',null,'โปรชั่วคราว'),h('select',{value:hours,onChange:e=>setHours(e.target.value)},h('option',{value:'24'},'ภายใน 24 ชั่วโมง'),h('option',{value:'168'},'ภายใน 7 วัน'))),h('label',null,h('span',null,'ราคาเปลี่ยนลดลงตั้งแต่'),h('select',{value:threshold,onChange:e=>setThreshold(e.target.value)},[10,20,30,50].map(n=>h('option',{key:n,value:String(n)},n+'%')))),h('div',{className:'sdd-dashboard-controls-note'},'ดูการเปลี่ยนราคาย้อนหลัง 7 วัน')),
  busy&&h('p',{className:'sdd-dashboard-loading',role:'status'},'กำลังตรวจรายการ…'),error&&h('p',{className:'sdd-error',role:'alert'},error),data&&h(wp.element.Fragment,null,h('div',{className:'sdd-dashboard-updated'},h('span',{'aria-hidden':true},'●'), (busy?' กำลังอัปเดต · แสดงข้อมูลที่โหลดได้เมื่อ ':error?' โหลดใหม่ไม่สำเร็จ · แสดงข้อมูลก่อนหน้าเมื่อ ':' ตรวจล่าสุด ')+date(data.server_time)+' · เวลาตามเว็บไซต์ '+(cfg.timezone||'UTC')),
- data.problems.items.length>0&&h('div',{className:'sdd-attention-banner',role:'status'},h('span',{className:'sdd-attention-icon','aria-hidden':true},'!'),h('div',null,h('strong',null,'มีโปรที่ควรตรวจสอบ '+data.problems.items.length+' รายการ'+(data.problems.limited?'ขึ้นไป':'')),h('p',null,'บางรายการหยุดทำงานหรือเลยกำหนด เริ่มตรวจจากรายการงานด้านล่าง')),h('a',{href:'#sdd-task-board'},'ดูรายการที่ต้องตรวจ →')),
+ data.problems.items.length>0&&h('div',{className:'sdd-attention-banner',role:'status'},h('span',{className:'sdd-attention-icon','aria-hidden':true},'!'),h('div',null,h('strong',null,'มีโปรที่ควรตรวจสอบ '+data.problems.items.length+' รายการ'+(data.problems.limited?'ขึ้นไป':'')),h('p',null,'บางรายการหยุดทำงานหรือเลยกำหนด เริ่มตรวจจากรายการงานด้านล่าง')),h('a',{href:'#sdd-task-board',onClick:()=>onOptions?.({dashboardTab:'problems'})},'ดูรายการที่ต้องตรวจ →')),
  h('div',{className:'sdd-overview-stats'},[['ต้องตรวจสอบ',data.problems.items.length,'red',data.problems.limited?'แสดง 100 รายการแรก':'โปรที่ควรจัดการก่อน'],['ใกล้เริ่มหรือจบ',data.upcoming.items.length,'blue','ตามช่วงเวลาที่เลือก'],['ราคาลดถึงเกณฑ์',data.changes.items.length,'amber','เหตุการณ์ใน 7 วันล่าสุด'],['งานระบบที่ควรตรวจ',data.jobs.length,'violet','ตรวจรายละเอียดด้านล่าง']].map(([label,count,tone,note])=>h('div',{key:label,className:'sdd-overview-stat '+tone},h('span',null,label),h('strong',null,count),h('small',null,note)))),
- h('div',{className:'sdd-dashboard-grid sdd-dashboard-workspace'},h(DashboardTasks,{data,onProduct,date,selectedTab:options.dashboardTab,onTabChange:tab=>onOptions?.({dashboardTab:tab})}),
+ h('div',{className:'sdd-dashboard-grid sdd-dashboard-workspace'},h(DashboardTasks,{data,onProduct,onAudit,date,selectedTab:options.dashboardTab,onTabChange:tab=>onOptions?.({dashboardTab:tab})}),
  h('section',{className:'sdd-dashboard-card sdd-dashboard-card--blue sdd-dashboard-jobs'},h('div',{className:'sdd-dashboard-card-header'},h('div',null,h('h2',null,'สถานะงานอัตโนมัติ'),h('p',{className:'sdd-dashboard-card-subtitle'},'ตรวจงานเบื้องหลัง เช่น การเริ่มและจบโปร')),h('span',{className:'sdd-dashboard-count'},data.jobs.length)),data.jobs.length?h('ul',{className:'sdd-dashboard-list'},data.jobs.map(j=>h('li',{key:j.job,className:'sdd-dashboard-job'},h('strong',null,jobs[j.job]||j.job),h('div',{className:'sdd-dashboard-detail'},j.next_at?'ถึงเวลาทำงานแล้วเมื่อ '+date(j.next_at)+' แต่ยังพบงานค้างอยู่':'ไม่พบกำหนดเวลาทำงาน')))):h('p',{className:'sdd-dashboard-empty'},h('span',{'aria-hidden':true},'✓'),'ไม่พบงานที่เลยกำหนดหรือไม่มีกำหนดเวลา'),h(CacheQueueSummary,{data:data.cache_updates}),h('div',{className:'sdd-dashboard-job-note'},h('strong',null,'รายการที่ยังไม่ทราบผล'),h('p',null,data.operations.state==='unavailable'?'ตรวจรายการไม่สำเร็จ กรุณาลองรีเฟรช':data.operations.count?(data.operations.at_least?'อย่างน้อย ':'')+data.operations.count+' รายการ · ตรวจผลก่อนทำรายการเดิมซ้ำ':'ไม่มีรายการที่รอตรวจ')),h('p',{className:'sdd-dashboard-caption'},'การมีกำหนดเวลาไม่ได้ยืนยันว่างานสำเร็จ หากพบปัญหาให้ตรวจรายละเอียดในหน้าตั้งค่า'),h('button',{className:'sdd-dashboard-more',onClick:onSettings},'ดูสถานะระบบในการตั้งค่า')))));
 }
 function collectPendingDrafts(fields,promotions){
@@ -1272,27 +1490,553 @@ function workspaceQuery(search,state){
  const fields={view:state.view,search:state.search,brand:state.brand,stock:state.status,source:state.source,article:state.promotionPost,promotion:state.promotion,page:state.page,size:state.size,scope:state.scope,sort:state.orderby,order:state.order,month:state.month,product:state.product,field:state.product?state.field:'',hours:state.dashboardHours,threshold:state.dashboardThreshold,task:state.dashboardTab,calendar_search:state.calendarSearch,calendar_status:state.calendarStatus,calendar_view:state.calendarView,day:state.calendarSelected};
  Object.entries(fields).forEach(([key,value])=>{if(value!==''&&value!=null)q.set('sdd_'+key,String(value));});return q.toString();
 }
-function DirectProduct({id,field,onClose,onSaved,onAudit,tick}){
+function DirectProduct({id,field,onClose,onSaved,onAudit,tick,onCacheJob}){
  const [row,setRow]=useState(null),[busy,setBusy]=useState(true),[error,setError]=useState(''),[retry,setRetry]=useState(0),[loadedAt,setLoadedAt]=useState('');
  const root=useRef(null);
- useEffect(()=>{let alive=true;setBusy(true);setError('');api('products/'+id).then(result=>{if(alive){setRow(result);setLoadedAt(new Date().toISOString());}}).catch(e=>{if(alive)setError(e.message);}).finally(()=>{if(alive)setBusy(false);});return()=>{alive=false;};},[id,tick,retry]);
+ const loadedRequest=useRef(null),directWrite=useRef(false);
+ const requestKey=id+':'+tick+':'+retry;
+ directWrite.current=loadedRequest.current===requestKey&&!busy&&!error&&!!row;
+ const canWrite=()=>directWrite.current;
+ const saved=(id,key,value,revision,result)=>{if(result)setRow(r=>r?applyPriceRow(r,id,key,value,revision,result):r);onSaved(id,key,value,revision,result);};
+ useEffect(()=>{
+  let alive=true,running=false;
+  async function readStatus(){
+   if(!alive||running||document.hidden)return;
+   running=true;
+   try{
+    const response=await api('cache-updates?'+new URLSearchParams({ids:id}));
+    if(alive){
+     cacheUpdates.set(String(id),response.items?.[id]||{state:'unavailable'});
+     window.dispatchEvent(new CustomEvent('sdd:cache-update'));
+    }
+   }catch(e){
+    if(alive){cacheUpdates.set(String(id),{state:'unavailable'});window.dispatchEvent(new CustomEvent('sdd:cache-update'));}
+   }finally{running=false;}
+  }
+  readStatus();const timer=setInterval(readStatus,15000);
+  document.addEventListener('visibilitychange',readStatus);
+  return()=>{alive=false;clearInterval(timer);document.removeEventListener('visibilitychange',readStatus);};
+ },[id,tick,retry]);
+ useEffect(()=>{let alive=true;setBusy(true);setError('');api('products/'+id).then(result=>{if(alive){loadedRequest.current=requestKey;setRow(result);setLoadedAt(new Date().toISOString());}}).catch(e=>{if(alive)setError(e.message);}).finally(()=>{if(alive)setBusy(false);});return()=>{alive=false;directWrite.current=false;};},[id,tick,retry]);
  useEffect(()=>{if(!row||busy||error)return;const el=field==='temporary_sale'?root.current?.querySelector('[data-sdd-focus-field="temporary_sale"]'):root.current?.querySelector('[data-sdd-field="'+field+'"]');const target=field==='temporary_sale'?el:el?.disabled?el.closest('.sdd-cell')?.querySelector('button:not(:disabled)'):el?.matches('input,select')?el:el?.querySelector('input,button');target?.focus();el?.scrollIntoView({block:'nearest',behavior:'smooth'});},[id,field,!!row,busy,error]);
  return h('section',{className:'sdd-direct-product','data-product-id':id,ref:root,'aria-label':'พื้นที่แก้ไขสินค้า'},h('div',{className:'sdd-direct-heading'},h('button',{onClick:onClose},'← กลับรายการเดิม'),h('span',null,'สินค้า #'+id+(row?.parent_id?' · ตัวเลือกย่อยของ #'+row.parent_id:'')),cfg.canAudit&&h('button',{onClick:()=>onAudit(id)},'ประวัติราคา')),
  busy&&h('p',{role:'status',className:'sdd-loading-notice'},row?'กำลังตรวจข้อมูลล่าสุด…':'กำลังเปิดสินค้าที่เลือก…'),error&&h('div',{role:'alert',className:'sdd-error'},error,row&&h('p',null,'ข้อมูลด้านล่างเป็นข้อมูลก่อนหน้า ยังแก้ไขไม่ได้'),h('button',{onClick:()=>setRetry(n=>n+1)},'ลองโหลดอีกครั้ง')),
  row&&h(wp.element.Fragment,null,h('p',{className:'sdd-last-loaded'},'ข้อมูลล่าสุดที่โหลดได้ '+displayDate(loadedAt)),
- h('div',{className:'sdd-direct-fields'},h('h2',null,row.name),h(CacheUpdateStatus,{id:row.id,detail:true}),row.attributes&&h('p',null,row.attributes),row.type==='variable'?h('p',null,'สินค้าแม่มีหลายตัวเลือก กลับไปขยายกลุ่มเพื่อเลือกตัวเลือกที่ต้องการแก้ไข'):['regular_price','sale_price','stock_status'].map(key=>h('div',{key,className:'sdd-direct-field'},h('h3',null,labels[key]),h(Cell,{row:busy||error?{...row,editable:{}}:row,field:key,onSaved})))),
- cfg.canSettings&&['simple','variation'].includes(row.type)&&!busy&&!error&&h(PromotionPanel,{row,onSaved,onClose})));
+ h('div',{className:'sdd-direct-fields'},h('h2',null,row.name),h(CacheUpdateStatus,{id:row.id,detail:true,onJob:onCacheJob}),row.storefront_url&&h('a',{href:row.storefront_url,target:'_blank',rel:'noopener noreferrer'},'เปิดหน้าสินค้าบนหน้าร้าน ↗'),row.attributes&&h('p',null,row.attributes),row.type==='variable'?h('p',null,'สินค้าแม่มีหลายตัวเลือก กลับไปขยายกลุ่มเพื่อเลือกตัวเลือกที่ต้องการแก้ไข'):['regular_price','sale_price','stock_status'].map(key=>h('div',{key,className:'sdd-direct-field'},h('h3',null,labels[key]),h(Cell,{row:busy||error?{...row,editable:{}}:row,field:key,onSaved:saved,canWrite})))),
+ cfg.canSettings&&(['simple','variation'].includes(row.type)||row.bundle_temp_promo)&&!busy&&!error&&h(PromotionPanel,{row,onSaved,onClose,onAudit,canWrite})));
+}
+const bulkPriceInteger=/^(?:0|[1-9]\d{0,14})$/;
+function bulkPriceDifference(before,after){
+ if(before===''&&bulkPriceInteger.test(after))return h('span',{className:'sdd-bulk-difference'},'ตั้งราคาใหม่');
+ if(!bulkPriceInteger.test(before)||!bulkPriceInteger.test(after))return '—';
+ const delta=Number(after)-Number(before);
+ if(!delta)return 'เท่าเดิม';
+ return h('span',{className:'sdd-bulk-difference '+(delta>0?'is-increase':'is-decrease')},
+  (delta>0?'เพิ่ม ':'ลด ')+Math.abs(delta).toLocaleString('en-US')+' บาท');
+}
+function bulkFormulaText({target,basis,direction,unit,amount}){
+ const change=direction==='decrease'?'ลด':'เพิ่ม';
+ const value=unit==='percent'?amount+'%':showValue(amount,target)+' บาท';
+ if(target==='regular_price')return change+'ราคาปกติ '+value;
+ if(basis==='sale_price')return change+'ราคาโปรเดิม '+value;
+ return 'ตั้งราคาโปร '+(direction==='decrease'?'ต่ำกว่า':'สูงกว่า')+'ราคาปกติ '+value;
+}
+function bulkFormulaExample(row,{target,basis,direction,unit,amount}){
+ const base=row[basis];
+ if(['pending','active','needs_review'].includes(row.temporary_sale?.status))return {reason:'มีโปรชั่วคราวที่ยังไม่ปิด'};
+ if(row.sale_schedule?.state&&row.sale_schedule.state!=='none')return {reason:'สินค้ามีตารางโปร'};
+ if(row.editable?.[target]===false)return {reason:'ช่องราคานี้แก้ไขไม่ได้'};
+ if(basis==='sale_price'&&(base===''||base==='0'))return {reason:'ยังไม่มีราคาโปรเดิมให้อิง'};
+ if(!bulkPriceInteger.test(base))return {reason:'ไม่มีราคาอ้างอิงที่ใช้คำนวณได้'};
+ const sign=direction==='decrease'?-1n:1n;
+ const before=BigInt(base);
+ let after;
+ if(unit==='percent'){
+  const [whole,fraction='']=amount.split('.');
+  const hundredths=BigInt(whole)*100n+BigInt(fraction.padEnd(2,'0'));
+  // Match the server's half-up rounding for whole-baht prices.
+  after=(before*(10000n+sign*hundredths)+5000n)/10000n;
+ }else{
+  after=before+sign*BigInt(amount);
+ }
+ const value=String(after);
+ if(!bulkPriceInteger.test(value))return {reason:'ราคาที่คำนวณได้อยู่นอกช่วงที่บันทึกได้'};
+ if((target==='sale_price'&&(!bulkPriceInteger.test(row.regular_price)||after>=BigInt(row.regular_price)))
+   ||(target==='regular_price'&&bulkPriceInteger.test(row.sale_price)&&BigInt(row.sale_price)>=after)){
+  return {reason:'ราคาโปรต้องต่ำกว่าราคาปกติ'};
+ }
+ return {value};
+}
+function BulkFormulaExamples({selection,params,validAmount}){
+ const rows=[...selection.values()].slice(0,3);
+ const price=(value,field)=>value===''||value==null?'—':showValue(value,field)+' บาท';
+ return h('section',{className:'sdd-bulk-examples','aria-labelledby':'sdd-bulk-example-title'},
+  h('div',{className:'sdd-bulk-example-heading'},
+   h('h3',{id:'sdd-bulk-example-title'},'ตัวอย่างจากสินค้าที่เลือก'),
+   selection.size>rows.length&&h('span',null,'แสดง '+rows.length+' จาก '+selection.size+' รายการ')),
+  h('p',null,validAmount?bulkFormulaText(params)+' · ราคายังไม่เปลี่ยน':'กรอกจำนวนเพื่อดูราคาใหม่ทันที'),
+  h('ul',null,rows.map(row=>{
+   const result=validAmount?bulkFormulaExample(row,params):{};
+   return h('li',{key:row.id},
+    h('div',{className:'sdd-bulk-example-product'},
+     row.thumbnail_url&&h('img',{src:row.thumbnail_url,alt:'',width:44,height:44,loading:'lazy',onError:e=>{e.currentTarget.hidden=true;}}),
+     h('div',null,h('strong',null,row.name),row.sku&&h('small',null,row.sku))),
+    h('div',{className:'sdd-bulk-example-values'},
+     h('div',null,h('span',null,params.target==='sale_price'?'ราคาโปรเดิม':'ราคาปกติเดิม'),
+      h('strong',null,price(row[params.target],params.target)),
+      params.basis!==params.target&&h('small',null,'อิงราคาปกติ '+price(row[params.basis],params.basis))),
+     h('div',{className:'sdd-bulk-example-new'},h('span',null,'ราคาที่คำนวณได้'),
+      result.value===undefined?h('span',null,'—'):h('strong',null,price(result.value,params.target))),
+     h('div',{className:'sdd-bulk-example-delta'},
+      result.reason?h('small',null,result.reason):result.value!==undefined&&bulkPriceDifference(row[params.target],result.value))));
+  })));
+}
+function BulkFormulaSteps({review,activeRef}){
+ return h('ol',{className:'sdd-bulk-steps','aria-label':'ขั้นตอนใช้สูตรเดียวทั้งชุด'},
+  h('li',{'aria-current':review?undefined:'step'},h('span',{'aria-hidden':true},review?'✓':'1'),'ตั้งสูตร'),
+  h('li',{'aria-current':review?'step':undefined,ref:activeRef,tabIndex:review?-1:undefined},h('span',{'aria-hidden':true},'2'),'ตรวจราคา'));
+}
+function BulkResultStatus({row}){
+ const statuses={pending:'รอบันทึก',succeeded:'บันทึกแล้ว',unknown:'ยังยืนยันผลไม่ได้',skipped:'ข้าม',stopped:'หยุด',conflict:'ข้อมูลเปลี่ยน',failed:'บันทึกไม่สำเร็จ'};
+ return h(wp.element.Fragment,null,statuses[row.status]||row.status,
+  (row.result?.message||row.reason)&&h('small',null,row.result?.message||row.reason),
+  row.child_operation_id&&h('small',null,row.child_operation_id));
+}
+function BulkFormulaCards({items}){
+ const price=(value,field)=>value===''?'—':showValue(value,field)+' บาท';
+ return h('ul',{className:'sdd-bulk-formula-cards'},items.map(row=>{
+  const unapplied=!['pending','succeeded'].includes(row.status);
+  return h('li',{key:row.item_id,className:unapplied?'is-unapplied':undefined},
+  h('div',{className:'sdd-bulk-formula-product'},h('strong',null,row.name||'#'+row.product_id),h('span',null,labels[row.field])),
+  row.status!=='pending'&&h('div',{className:'sdd-bulk-formula-status'},h(BulkResultStatus,{row})),
+  h('dl',{className:'sdd-bulk-formula-prices'},
+   h('div',null,h('dt',null,'ราคาเดิม'),h('dd',null,price(row.before,row.field))),
+   h('div',null,h('dt',null,unapplied?'ราคาที่คำนวณ':'ราคาใหม่'),h('dd',null,h('strong',null,price(row.after,row.field)))),
+   h('div',null,h('dt',null,'ส่วนต่าง'),h('dd',null,bulkPriceDifference(row.before,row.after)))));
+ }));
+}
+function BulkTemporaryRows({rows,onPrice,busy}){
+ const price=value=>value==null||value===''?'—':showValue(value,'sale_price')+' บาท';
+ return h('ul',{className:'sdd-bulk-temp-rows'},rows.map(row=>{
+  const {schedule}=row;
+  const needsReview=schedule?.status==='needs_review';
+  const openReview=needsReview||(!onPrice&&row.status==='conflict');
+  const invalid=!!onPrice&&row.after!==''&&!bulkPriceInteger.test(row.after);
+  const url=new URL(window.location.href);
+  url.searchParams.set('sdd_product',row.product_id);
+  url.searchParams.set('sdd_field','temporary_sale');
+  return h('li',{key:row.item_id,className:'sdd-bulk-temp-row'},
+   h('div',{className:'sdd-bulk-temp-identity'},
+    h('div',null,h('strong',null,row.name),row.sku&&h('small',null,row.sku)),
+    h('span',{className:'sdd-status '+(schedule?.status||'')},schedule?promoLabels[schedule.status]||schedule.status:'ยังไม่มีโปรชั่วคราว')),
+   schedule&&h('div',{className:'sdd-bulk-temp-fields'},
+    h('div',null,h('span',null,'ราคาโปรเดิม'),h('strong',null,price(row.before))),
+    h('div',null,
+     onPrice&&!needsReview?h('label',{className:'sdd-bulk-field'},'ราคาโปรใหม่ (บาท)',h('input',{
+      'aria-label':'ราคาโปรใหม่ '+row.name+(row.sku?' · '+row.sku:' #'+row.product_id),
+      inputMode:'numeric',value:row.after,disabled:!!busy,'aria-invalid':invalid,
+      'aria-describedby':invalid?'sdd-temp-price-error-'+row.product_id:undefined,
+      onChange:e=>onPrice(row.product_id,e.target.value)}),
+      invalid&&h('small',{id:'sdd-temp-price-error-'+row.product_id},'จำนวนเต็มไม่เกิน 15 หลัก')):
+      h(wp.element.Fragment,null,h('span',null,'ราคาโปรใหม่'),h('strong',null,price(row.after))),
+     !invalid&&row.after!==''&&row.after!=null&&row.after!==row.before&&bulkPriceDifference(row.before,row.after)),
+    h('div',null,h('span',null,'มีผลเมื่อ'),h('strong',null,needsReview?'รอตรวจสอบ':
+     !onPrice&&!['pending','succeeded'].includes(row.status)?'—':
+     schedule.status==='active'?(row.status==='succeeded'?'มีผลแล้ว':'หลังยืนยันบันทึก'):promoTime(schedule.starts_at))),
+    h('div',null,h('span',null,'สิ้นสุด'),h('strong',null,promoTime(schedule.ends_at))),
+    h('div',null,h('span',null,'ราคาหลังจบตามแผน'),h('strong',null,price(schedule.return_price)))),
+   openReview&&h('div',{className:'sdd-bulk-temp-note'},needsReview&&h('span',null,schedule.message||'ตรวจราคาและสถานะโปรก่อนแก้ไข'),
+    h('a',{href:url.href,target:'_blank',rel:'noopener noreferrer'},'เปิดจัดการโปรในแท็บใหม่')),
+   !onPrice&&row.status!=='pending'&&h('div',{className:'sdd-bulk-formula-status'},h(BulkResultStatus,{row})));
+ }));
+}
+function BulkCreatePromotions({selection,onChanged}){
+ const [startNow,setStartNow]=useState(true),[start,setStart]=useState(''),[end,setEnd]=useState('');
+ const [prices,setPrices]=useState({}),[review,setReview]=useState(null),[done,setDone]=useState(null);
+ const [busy,setBusy]=useState(''),[error,setError]=useState(''),[uncertain,setUncertain]=useState(false);
+ const key='sdd-bulk-create-promo:'+cfg.api+':'+cfg.userId;
+ const [last,setLast]=useState(()=>{try{return sessionStorage.getItem(key)||'';}catch{return '';}});
+ const heading=useRef(null);
+ useEffect(()=>{heading.current?.focus();},[!!review,!!done]);
+ const selected=[...selection.values()];
+ const changes=selected.filter(row=>!row.temporary_sale&&row.editable?.sale_price&&prices[row.id])
+  .map(row=>({id:String(row.id),price:prices[row.id]}));
+ const now=localMinute(Date.now()/1000);
+ const startError=!startNow&&start&&start<=now?'วันเริ่มต้องอยู่ในอนาคต':'';
+ const endError=end&&(end<=now||!startNow&&start&&end<=start)?'วันจบต้องอยู่หลังเวลาเริ่มโปร':'';
+ const pricingError=changes.some(row=>!bulkPriceInteger.test(row.price)||row.price==='0');
+ const nextStep=!startNow&&!start?'เลือกวันและเวลาเริ่มโปร':startError?'แก้เวลาเริ่มโปร':
+  !end?'เลือกวันและเวลาจบโปร':endError?'แก้เวลาจบโปร':!changes.length?'กรอกราคาโปรอย่างน้อย 1 สินค้า':
+  changes.length>100?'ตั้งโปรได้สูงสุด 100 รายการต่อชุด':pricingError?'แก้ราคาที่มีข้อความแจ้ง':'';
+ const valid=!nextStep;
+ const money=value=>value==null||value===''?'—':showValue(value,'sale_price')+' บาท';
+ const run=async(message,action)=>{
+  if(busy)return;
+  setBusy(message);setError('');
+  try{await action();}catch(e){setError(e.message);}finally{setBusy('');}
+ };
+ const inspect=()=>run('กำลังตรวจผล…',async()=>{
+  const response=await api('promotion-import/'+(review?.batch||last));
+  if(response.status==='completed'){setDone(response);setReview(null);onChanged([]);}
+  else setReview(response);
+  setUncertain(false);
+ });
+ const preview=()=>run('กำลังตรวจราคาและช่วงโปร…',async()=>{
+  const response=await api('promotion-bulk',{start:startNow?'now':start,end,rows:changes});
+  setReview(response);
+ });
+ const confirm=()=>run('กำลังบันทึกแผนโปร…',async()=>{
+  setLast(review.batch);
+  try{sessionStorage.setItem(key,review.batch);}catch{}
+  try{
+   const result=await api('promotion-import/'+review.batch,{revision:review.revision});
+   setDone(result);setReview(null);onChanged([]);
+  }catch(e){if(e.code==='operation_unknown')setUncertain(true);throw e;}
+ });
+ const period=review?.rows[0];
+ const calendarLink=done?.first_start?new URL(window.location.href):null;
+ if(calendarLink){
+  const day=datePart(String(done.first_start));
+  calendarLink.searchParams.delete('sdd_product');
+  calendarLink.searchParams.delete('sdd_field');
+  calendarLink.searchParams.set('sdd_view','calendar');
+  calendarLink.searchParams.set('sdd_month',day.slice(0,7));
+  calendarLink.searchParams.set('sdd_day',day);
+ }
+ return h('section',{className:'sdd-bulk-create','aria-busy':!!busy},
+  busy&&h('p',{role:'status'},busy),
+  error&&h('p',{role:'alert',className:'sdd-error'},error),
+  done?h('div',{className:'sdd-bulk-result',role:'status'},
+   h('h3',{tabIndex:-1,ref:heading},'ตั้งโปรแล้ว '+done.count+' รายการ'),
+   calendarLink&&h('a',{href:calendarLink.href},'ดูสถานะในปฏิทินโปรชั่วคราว')):
+  review?h(wp.element.Fragment,null,
+   h('h3',{tabIndex:-1,ref:heading},'ตรวจแผนโปรก่อนยืนยัน'),
+   h('div',{className:'sdd-bulk-result'},
+    h('strong',null,'พร้อมตั้งโปร '+review.rows.length+' รายการ'+(review.excluded?.length?' · ข้าม '+review.excluded.length+' รายการ':'')),
+    period&&h('div',null,(review.start_now?'เริ่มหลังบันทึก':'เริ่ม '+promoTime(period.start))+' · จบ '+promoTime(period.end))),
+   h('ul',{className:'sdd-bulk-temp-rows'},review.rows.map(row=>h('li',{key:row.id,className:'sdd-bulk-temp-row'},
+    h('strong',null,row.name),
+    h('div',{className:'sdd-bulk-create-prices'},
+     h('div',null,h('small',null,'ราคาปัจจุบัน'),money(row.current_price)),
+     h('div',null,h('small',null,'ราคาโปร'),h('strong',null,money(row.price))),
+     h('div',null,h('small',null,'ราคาหลังจบตามแผน'),money(row.after))))),
+    review.excluded?.map(row=>h('li',{key:row.id,className:'sdd-bulk-temp-row'},h('strong',null,row.name),h('p',null,row.message)))),
+   h('div',{className:'sdd-bulk-footer'},
+    h('button',{type:'button',disabled:!!busy||uncertain,onClick:()=>{setReview(null);setError('');}},'กลับไปแก้'),
+    uncertain?h('button',{type:'button',className:'sdd-primary',disabled:!!busy,onClick:inspect},'ตรวจผลชุดเดิม'):
+     h('button',{type:'button',className:'sdd-primary',disabled:!!busy||!period,onClick:confirm},
+      (review.start_now?'เริ่มโปรหลังบันทึก ':'ตั้งโปรล่วงหน้า ')+review.rows.length+' รายการ'))):
+  h('form',{className:'sdd-bulk-create-form',onSubmit:e=>{e.preventDefault();if(valid&&!busy)preview();}},
+   last&&h('button',{type:'button',className:'sdd-bulk-recover',disabled:!!busy,onClick:inspect},'ตรวจผลชุดเดิม'),
+   h('fieldset',{className:'sdd-bulk-create-dates'},
+    h('legend',{tabIndex:-1,ref:heading},'ช่วงเวลาโปรของทั้งชุด'),
+    h('div',{className:'sdd-bulk-start-options'},
+     h('label',null,h('input',{type:'radio',name:'sdd-bulk-promo-start',checked:startNow,disabled:!!busy,onChange:()=>setStartNow(true)}),'เริ่มหลังบันทึก'),
+     h('label',null,h('input',{type:'radio',name:'sdd-bulk-promo-start',checked:!startNow,disabled:!!busy,onChange:()=>setStartNow(false)}),'ตั้งวันเริ่มล่วงหน้า')),
+    h('div',{className:'sdd-bulk-create-datetime'},
+     !startNow&&h('label',{className:'sdd-bulk-field'},'วันและเวลาเริ่ม',h('input',{type:'datetime-local',value:start,disabled:!!busy,
+      'aria-invalid':!!startError,'aria-describedby':startError?'sdd-bulk-create-start-error':'sdd-bulk-create-timezone',onChange:e=>setStart(e.target.value)}),
+      startError&&h('small',{id:'sdd-bulk-create-start-error',className:'sdd-bulk-create-error'},startError)),
+     h('label',{className:'sdd-bulk-field'},'วันและเวลาจบ',h('input',{type:'datetime-local',value:end,disabled:!!busy,
+      'aria-invalid':!!endError,'aria-describedby':endError?'sdd-bulk-create-end-error':'sdd-bulk-create-timezone',onChange:e=>setEnd(e.target.value)}),
+      endError&&h('small',{id:'sdd-bulk-create-end-error',className:'sdd-bulk-create-error'},endError))),
+    h('small',{id:'sdd-bulk-create-timezone'},cfg.timezone==='Asia/Bangkok'?'เวลาไทย (UTC+7)':'เขตเวลา '+(cfg.timezone||'UTC'))),
+   h('div',{className:'sdd-bulk-create-heading'},
+    h('h3',null,'ราคาของสินค้าที่ร่วมโปร'),
+    h('p',null,'เว้นช่องราคาโปรไว้สำหรับสินค้าที่ไม่ร่วมโปร'+(!end?' · เลือกวันจบเพื่อดูราคาที่จะคืน':''))),
+   h('table',{className:'sdd-bulk-create-table',role:'table','aria-label':'ราคาสินค้าที่ร่วมโปร'},
+    h('thead',{role:'rowgroup'},h('tr',{role:'row'},['สินค้า','ราคาปัจจุบัน','ราคาโปร (บาท)','คืนหลังจบตามแผน'].map(label=>h('th',{key:label,scope:'col',role:'columnheader'},label)))),
+    h('tbody',{role:'rowgroup'},selected.map(row=>{
+    const value=prices[row.id]||'';
+    const invalid=value!==''&&(!bulkPriceInteger.test(value)||value==='0');
+    const existing=row.temporary_sale;
+    const url=new URL(window.location.href);
+    url.searchParams.set('sdd_product',row.id);url.searchParams.set('sdd_field','temporary_sale');
+    return h('tr',{key:row.id,role:'row',className:value&&!invalid?'is-priced':undefined},
+     h('th',{scope:'row',role:'rowheader'},h('strong',null,row.name),row.sku&&h('small',null,row.sku)),
+     existing||!row.editable?.sale_price?h('td',{role:'cell',colSpan:3,className:'sdd-bulk-create-blocked'},
+      existing?h(wp.element.Fragment,null,'มีโปรชั่วคราวอยู่แล้ว',h('a',{href:url.href,target:'_blank',rel:'noopener noreferrer'},'เปิดจัดการโปร')):
+       'สินค้านี้ยังตั้งราคาโปรไม่ได้'):
+      h(wp.element.Fragment,null,
+       h('td',{role:'cell'},h('span',{className:'sdd-bulk-create-mobile','aria-hidden':true},'ราคาปัจจุบัน'),money(row.current_price)),
+       h('td',{role:'cell'},h('div',{className:'sdd-bulk-field'},
+        h('span',{className:'sdd-bulk-create-mobile','aria-hidden':true},'ราคาโปร (บาท)'),
+        h('input',{'aria-label':'ราคาโปร '+row.name+(row.sku?' · '+row.sku:' #'+row.id),inputMode:'numeric',placeholder:'กรอกราคา',
+         value:displayPrice(value),disabled:!!busy,'aria-invalid':invalid,'aria-describedby':invalid?'sdd-bulk-create-price-'+row.id:undefined,
+         onChange:e=>editPrice(e,price=>setPrices(current=>({...current,[row.id]:price})))}),
+        invalid&&h('small',{id:'sdd-bulk-create-price-'+row.id,className:'sdd-bulk-create-error'},'กรอกราคาจำนวนเต็มมากกว่า 0 ไม่เกิน 15 หลัก'))),
+       h('td',{role:'cell',className:'sdd-bulk-create-restore'},h('span',{className:'sdd-bulk-create-mobile','aria-hidden':true},'คืนหลังจบตามแผน'),end&&!endError?money(restoredPrice(row,end)):'—')));
+   }))),
+   h('div',{className:'sdd-bulk-footer sdd-bulk-create-footer'},
+    h('p',{role:'status'},nextStep||(changes.length+' รายการพร้อมตรวจ')),
+    h('button',{type:'submit',className:'sdd-primary',disabled:!!busy||!valid},'ตรวจแผนโปร'))));
+}
+function BulkPricePanel({selection,eventId,onClose,onChanged}){
+ const [params,setParams]=useState({target:'regular_price',basis:'regular_price',direction:'decrease',unit:'baht',amount:''});
+ const [mode,setMode]=useState('manual'),[manual,setManual]=useState({});
+ const [temporary,setTemporary]=useState({});
+ const [batch,setBatch]=useState(null),[busy,setBusy]=useState(''),[error,setError]=useState(''),[zero,setZero]=useState(false);
+ const [needsCheck,setNeedsCheck]=useState(false);
+ const heading=useRef(null),reviewHeading=useRef(null);
+ const key='sdd-bulk:'+cfg.api+':'+cfg.userId+':'+(eventId||'bulk');
+ const [remembered,setRemembered]=useState(()=>{try{return sessionStorage.getItem(key)||'';}catch{return '';}});
+ const label=eventId?'ย้อนราคา':'แก้ราคาหลายรายการ';
+ const reviewing=!!batch;
+ const reviewedFormula=batch?.params?.action==='adjust_price'?batch.params.params:null;
+ const temporaryView=!eventId&&(reviewing?batch.kind==='bulk_temp_price':mode==='temporary');
+ const createView=!eventId&&!reviewing&&mode==='create';
+ const formulaView=!eventId&&(reviewing?!!reviewedFormula:mode==='formula');
+ const manualEntry=!eventId&&!reviewing&&mode==='manual'&&selection.size>0;
+ const formulaPreview=formulaView&&batch?.status==='preview';
+ const reviewedIds=batch?.params?.ids;
+ const sameFormulaSelection=Array.isArray(reviewedIds)&&reviewedIds.length===selection.size&&reviewedIds.every(id=>selection.has(id));
+ useEffect(()=>{(reviewing?reviewHeading:heading).current?.focus();},[reviewing,formulaPreview]);
+ const patch=change=>setParams(current=>({...current,...change,...(change.target==='regular_price'?{basis:'regular_price'}:{})}));
+ const manualField=row=>manual[row.id]?.field||(row.editable?.regular_price?'regular_price':'sale_price');
+ const manualRows=[...selection.values()].map(row=>{
+  const field=manualField(row);
+  return {row,field,before:row[field],value:manual[row.id]?.value??''};
+ });
+ const changes=manualRows.filter(({row,field,before,value})=>row.editable?.[field]&&value!==''&&value!==before);
+ const validManual=changes.length>0&&changes.every(({value})=>bulkPriceInteger.test(value));
+ const temporaryRows=temporaryView&&!batch?[...selection.values()].map(row=>({
+  item_id:row.id,product_id:row.id,name:row.name,sku:row.sku,schedule:row.temporary_sale?.id?row.temporary_sale:null,
+  before:row.temporary_sale?.price??'',after:temporary[row.id]??'',
+ })):[];
+ const temporaryChanges=temporaryRows.filter(row=>['pending','active'].includes(row.schedule?.status)&&row.after!==''&&row.after!==row.before);
+ const temporaryReviewCount=temporaryRows.filter(row=>row.schedule?.status==='needs_review').length;
+ const validTemporary=temporaryChanges.length>0&&temporaryChanges.every(row=>bulkPriceInteger.test(row.after));
+ const saveBatch=result=>{
+  setBatch(result);
+  setNeedsCheck(false);
+  setRemembered(result.operation_id);
+  try{sessionStorage.setItem(key,result.operation_id);}catch{}
+ };
+ const applySaved=result=>{
+  const saved=result.items.filter(row=>row.status==='succeeded');
+  if(!saved.length)return;
+  if(result.kind==='bulk_temp_price'){
+   setTemporary(current=>{
+    const next={...current};
+    for(const row of saved)if(next[row.product_id]===row.after)delete next[row.product_id];
+    return next;
+   });
+   onChanged(saved);
+   return;
+  }
+  setManual(current=>{
+   const next={...current};
+   for(const {product_id,field,after} of saved){
+    if(next[product_id]?.field===field&&next[product_id].value===after)delete next[product_id];
+   }
+   return next;
+  });
+  onChanged(saved);
+ };
+ const run=async(message,action)=>{
+  if(busy)return;
+  setBusy(message);setError('');
+  try{await action();}catch(e){setError(e.message);}finally{setBusy('');}
+ };
+ const check=()=>run('กำลังตรวจผลชุดเดิม…',async()=>{
+  const result=await api('operations/'+(batch?.operation_id||remembered));
+  saveBatch(result);
+  applySaved(result);
+ });
+ const preview=()=>run('กำลังตรวจราคา…',async()=>{
+  const payload=mode==='temporary'?{action:'set_temporary_prices',rows:temporaryChanges.map(row=>({id:String(row.product_id),promotion_id:row.schedule.id,value:row.after}))}:
+   mode==='manual'?{action:'set_prices',rows:changes.map(({row,field,value})=>({id:String(row.id),field,value}))}:
+   {ids:[...selection.keys()],action:'adjust_price',params};
+  const result=eventId?await api('events/'+eventId+'/rollback-preview',{}):await api('bulk/preview',payload);
+  setZero(false);saveBatch(result);
+ });
+ const execute=()=>run(batch.status==='preview'?'รอยืนยันการบันทึกราคา…':'กำลังบันทึกราคา…',async()=>{
+  if(batch.status==='preview'&&!await confirmChange('ยืนยัน '+batch.pending+' รายการตามราคาในผลตรวจก่อนบันทึก',{title:label,confirmLabel:'ยืนยันบันทึกราคา'}))return;
+  setBusy('กำลังบันทึกราคา…');
+  try{
+   const result=await api('operations/'+batch.operation_id+'/execute',{confirmation_hash:batch.payload_hash,acknowledgements:zero?['price_change','zero_price']:['price_change']});
+   saveBatch(result);
+   applySaved(result);
+  }catch(e){setNeedsCheck(true);throw e;}
+ });
+ const stop=()=>run('กำลังหยุดรายการที่เหลือ…',async()=>{
+  if(await confirmChange('หยุดรายการที่ยังไม่เริ่ม โดยคงราคาและหลักฐานของคำสั่งเดิม',{title:'หยุดชุดนี้?',confirmLabel:'ยืนยันหยุดชุด'})){
+   saveBatch(await api('operations/'+batch.operation_id+'/stop',{confirmed:true}));
+  }
+ });
+ const choice=(title,key,options)=>h('div',{className:'sdd-bulk-field'},
+  h('label',{htmlFor:'sdd-bulk-'+key},title),
+  h('select',{id:'sdd-bulk-'+key,disabled:busy,value:params[key],onChange:e=>patch({[key]:e.target.value})},
+   options.map(([value,name])=>h('option',{key:value,value},name))));
+ const zeroRequired=batch?.items.some(row=>row.status==='pending'&&row.after==='0');
+ const empty=!eventId&&!batch&&!selection.size;
+ const percent=params.unit==='percent';
+ const validAmount=percent?/^(?:0|[1-9]\d?)(?:\.\d{1,2})?$|^100(?:\.0{1,2})?$/.test(params.amount):bulkPriceInteger.test(params.amount);
+ const amountHint=percent?'0–100% ทศนิยมไม่เกิน 2 ตำแหน่ง':'จำนวนเต็มไม่เกิน 15 หลัก';
+ const editFormula=()=>{
+  setMode('formula');
+  setParams(reviewedFormula);
+  setBatch(null);
+ };
+ const previewCount=batch?batch.pending+' รายการพร้อมบันทึก'+(batch.progress.skipped?' · ข้าม '+batch.progress.skipped+' รายการ':''):'';
+ return h('section',{className:'sdd-setup-card sdd-bulk-panel'+(formulaView?' sdd-bulk-formula':temporaryView||createView?' sdd-bulk-temp':manualEntry?' sdd-bulk-manual':''),'aria-labelledby':'sdd-bulk-title','aria-busy':!!busy},
+  h('header',{className:'sdd-bulk-header'},h('h2',{id:'sdd-bulk-title',tabIndex:-1,ref:heading},label),
+   !empty&&h('button',{type:'button',disabled:busy,onClick:()=>onClose(false),
+    'aria-label':formulaView||manualEntry?'กลับรายการสินค้า':undefined},eventId?'← กลับประวัติราคา':formulaView||manualEntry?'← กลับ':'← กลับรายการสินค้า')),
+  error&&h('p',{role:'alert',className:'sdd-error'},error),
+  busy&&h('p',{role:'status'},busy),
+  !batch&&h(wp.element.Fragment,null,
+   remembered&&!createView&&h('button',{type:'button',className:'sdd-bulk-recover',disabled:busy,onClick:check},'เปิดผลชุดเดิม'),
+   empty?h('div',{className:'sdd-bulk-empty'},
+    h('h3',null,'ยังไม่ได้เลือกสินค้า'),
+    h('p',null,'กลับไปติ๊กเลือกสินค้าที่ต้องการแก้ราคา แล้วเปิด “แก้ราคาหลายรายการ” อีกครั้ง'),
+    h('button',{type:'button',className:'sdd-primary',disabled:busy,onClick:()=>onClose(true)},'ไปเลือกสินค้า')):
+   eventId?h('div',{className:'sdd-bulk-rollback'},h('p',null,'เหตุการณ์ #'+eventId+' · ตรวจราคาปัจจุบันและราคาที่จะย้อนก่อนยืนยัน'),
+    h('button',{type:'button',className:'sdd-primary',disabled:busy,onClick:preview},'ตรวจราคาก่อนบันทึก')):
+   h(wp.element.Fragment,null,
+   h('div',{className:'sdd-bulk-mode','aria-label':'วิธีแก้ราคา',role:'group'},
+    h('button',{type:'button','aria-pressed':mode==='manual',disabled:busy,onClick:()=>setMode('manual')},'กรอกราคาแยกแต่ละสินค้า'),
+    h('button',{type:'button','aria-pressed':mode==='formula',disabled:busy,onClick:()=>setMode('formula')},'ใช้สูตรเดียวทั้งชุด'),
+    cfg.canImportPromotions&&h('button',{type:'button','aria-pressed':mode==='create',disabled:busy,onClick:()=>setMode('create')},'ตั้งโปรชั่วคราว'),
+    cfg.canImportPromotions&&h('button',{type:'button','aria-pressed':mode==='temporary',disabled:busy,onClick:()=>setMode('temporary')},'แก้โปรชั่วคราว')),
+   createView?h(BulkCreatePromotions,{selection,onChanged}):
+   temporaryView?h('form',{className:'sdd-bulk-form',onSubmit:e=>{e.preventDefault();if(!busy&&validTemporary)preview();}},
+    h('p',{className:'sdd-bulk-manual-hint'},'กรอกราคาโปรใหม่รายสินค้า ระบบใช้วันเริ่ม วันจบ และแผนคืนราคาเดิม'),
+    h(BulkTemporaryRows,{rows:temporaryRows,onPrice:(id,value)=>setTemporary(current=>({...current,[id]:value})),busy}),
+    h('div',{className:'sdd-bulk-footer'},h('p',{role:'status'},'แก้ราคาโปร '+temporaryChanges.length+' รายการ'+
+     (temporaryReviewCount?' · ต้องตรวจสอบ '+temporaryReviewCount+' รายการ':'')),
+     h('button',{type:'submit',className:'sdd-primary',disabled:busy||!validTemporary},'ตรวจโปรก่อนบันทึก'))):
+   mode==='manual'?h('form',{className:'sdd-bulk-form',onSubmit:e=>{e.preventDefault();if(!busy&&validManual)preview();}},
+    h('p',{className:'sdd-bulk-manual-hint'},'เลือกช่องราคาแล้วกรอกจำนวนเต็ม เว้นว่างสำหรับสินค้าที่ไม่ต้องการแก้'),
+    h('table',{className:'sdd-bulk-manual-table',role:'table','aria-label':'ราคาสินค้าที่เลือก'},
+     h('thead',{role:'rowgroup'},h('tr',{role:'row'},['สินค้า','ช่องราคา','ราคาเดิม','ราคาใหม่ (บาท)','ส่วนต่าง'].map(text=>h('th',{key:text,scope:'col',role:'columnheader'},text)))),
+     h('tbody',{role:'rowgroup'},manualRows.map(({row,field,before,value})=>{
+     const invalid=value!==''&&!bulkPriceInteger.test(value);
+     const edited=value!==''&&value!==before;
+     const name=row.name+(row.sku?' · '+row.sku:' #'+row.id);
+     return h('tr',{key:row.id,role:'row',className:'sdd-bulk-manual-row'+(edited?' is-edited':'')},
+      h('th',{scope:'row',role:'rowheader',className:'sdd-bulk-manual-product'},h('strong',null,row.name),h('small',null,row.sku||'#'+row.id)),
+      h('td',{role:'cell'},h('div',{className:'sdd-bulk-field'},h('span',{className:'sdd-bulk-mobile-label','aria-hidden':true},'ช่องราคา'),
+       h('select',{'aria-label':'ช่องราคา '+name,value:field,disabled:busy,onChange:e=>setManual(current=>({...current,[row.id]:{field:e.target.value,value:''}}))},
+        h('option',{value:'regular_price',disabled:!row.editable?.regular_price},'ราคาปกติ'),
+        h('option',{value:'sale_price',disabled:!row.editable?.sale_price},'ราคาโปร')))),
+      h('td',{role:'cell',className:'sdd-bulk-previous'},h('span',{className:'sdd-bulk-mobile-label','aria-hidden':true},'ราคาเดิม'),h('strong',null,showValue(before,field)),before!==''&&h('small',null,' บาท')),
+      h('td',{role:'cell'},h('div',{className:'sdd-bulk-field'},h('span',{className:'sdd-bulk-mobile-label','aria-hidden':true},'ราคาใหม่ (บาท)'),
+       h('input',{'aria-label':'ราคาใหม่ '+name,inputMode:'numeric',value,placeholder:'ราคาใหม่',disabled:busy||!row.editable?.[field],
+        'aria-invalid':invalid,'aria-describedby':invalid?'sdd-bulk-price-error-'+row.id:undefined,
+        onChange:e=>setManual(current=>({...current,[row.id]:{field,value:e.target.value}}))}),
+       invalid&&h('small',{id:'sdd-bulk-price-error-'+row.id},'จำนวนเต็มไม่เกิน 15 หลัก'))),
+      h('td',{role:'cell',className:'sdd-bulk-delta'},h('span',{className:'sdd-bulk-mobile-label','aria-hidden':true},'ส่วนต่าง'),
+       invalid?'—':edited?bulkPriceDifference(before,value):h('span',{className:'sdd-bulk-unchanged'},'คงเดิม')));
+    }))),
+    h('div',{className:'sdd-bulk-footer sdd-bulk-manual-footer'},h('p',{role:'status'},'แก้ราคา '+changes.length+' จาก '+selection.size+' รายการ'),
+     h('button',{type:'submit',className:'sdd-primary',disabled:busy||!validManual},'ตรวจราคาก่อนบันทึก'))):
+   h('form',{className:'sdd-bulk-form',onSubmit:e=>{e.preventDefault();if(!busy&&validAmount)preview();}},
+    h(BulkFormulaSteps,{review:false}),
+    h('details',{className:'sdd-bulk-selection'},
+     h('summary',null,'สินค้าที่เลือก '+selection.size+' รายการ'),
+     h('ul',null,[...selection.values()].map(item=>h('li',{key:item.id},item.name,h('small',null,item.sku||'#'+item.id))))),
+    h('div',{className:'sdd-bulk-form-settings'},
+     h('div',{className:'sdd-bulk-form-grid sdd-bulk-form-basis'},
+      choice('ราคาที่จะแก้','target',[['regular_price','ราคาปกติ'],['sale_price','ราคาโปร']]),
+      params.target==='sale_price'&&choice('อิงจากราคา','basis',[['regular_price','ราคาปกติ'],['sale_price','ราคาโปรเดิม']])),
+     h('div',{className:'sdd-bulk-form-grid sdd-bulk-form-change'},
+      choice('เพิ่มหรือลด','direction',[['decrease','ลด'],['increase','เพิ่ม']]),
+      h('label',{className:'sdd-bulk-field'},'จำนวน',h('input',{inputMode:percent?'decimal':'numeric',disabled:busy,value:params.amount,
+       'aria-describedby':'sdd-bulk-amount-hint','aria-invalid':!!params.amount&&!validAmount,onChange:e=>patch({amount:e.target.value})})),
+      choice('หน่วย','unit',[['baht','บาท'],['percent','เปอร์เซ็นต์']]),
+      h('small',{id:'sdd-bulk-amount-hint'},amountHint))),
+    h(BulkFormulaExamples,{selection,params,validAmount}),
+    h('div',{className:'sdd-bulk-footer'},h('p',null,'ตรวจสินค้าที่เลือกทั้งหมดก่อนยืนยันบันทึก'),
+     h('button',{type:'submit',className:'sdd-primary',disabled:busy||!validAmount},'ตรวจราคาก่อนบันทึก'))))),
+  batch&&h('div',{className:'sdd-bulk-review'},
+   formulaPreview?h(BulkFormulaSteps,{review:true,activeRef:reviewHeading}):
+    h('h3',{tabIndex:-1,ref:reviewHeading},batch.status==='preview'?'ตรวจราคาก่อนบันทึก':'ผลการแก้ราคา'),
+   formulaView&&h('div',{className:'sdd-bulk-formula-summary'},
+    h('div',null,h('strong',null,bulkFormulaText(reviewedFormula)),
+     formulaPreview&&h('p',{role:'status'},previewCount)),
+    formulaPreview&&sameFormulaSelection&&h('button',{type:'button',disabled:busy||needsCheck,onClick:editFormula},'แก้สูตร')),
+   !formulaPreview&&h('p',{role:'status',className:'sdd-bulk-result'},batch.status==='preview'?previewCount+' · ราคายังไม่เปลี่ยน':
+    'สำเร็จ '+(batch.progress.succeeded||0)+' · รอ '+batch.pending+' · ยืนยันผลไม่ได้ '+batch.unknown+(batch.status==='stopped'?' · หยุดชุดแล้ว':'')),
+   needsCheck&&h('p',{role:'status'},'ตรวจผลชุดเดิมก่อนทำรายการที่เหลือต่อ'),
+   temporaryView?h(BulkTemporaryRows,{rows:batch.items}):formulaView?h(BulkFormulaCards,{items:batch.items}):h('div',{className:'sdd-tablewrap'},h('table',null,
+    h('thead',null,h('tr',null,['สินค้า','ราคาเดิม','ราคาใหม่','เปลี่ยนแปลง','สถานะ'].map(text=>h('th',{key:text,scope:'col'},text)))),
+    h('tbody',null,batch.items.map(row=>h('tr',{key:row.item_id},
+     h('td',null,row.name||'#'+row.product_id,h('small',null,labels[row.field])),
+     h('td',null,h('span',{className:'sdd-bulk-mobile-label'},'ราคาเดิม'),showValue(row.before,row.field)),
+     h('td',null,h('span',{className:'sdd-bulk-mobile-label'},'ราคาใหม่'),h('strong',null,showValue(row.after,row.field))),
+     h('td',null,h('span',{className:'sdd-bulk-mobile-label'},'เปลี่ยนแปลง'),bulkPriceDifference(row.before,row.after)),
+     h('td',null,h(BulkResultStatus,{row}))))))),
+   zeroRequired&&h('label',null,h('input',{type:'checkbox',checked:zero,disabled:busy,onChange:e=>setZero(e.target.checked)}),' ยืนยันรายการที่ตั้งเป็น 0 บาท'),
+   h('div',{className:'sdd-bulk-footer sdd-bulk-review-actions'+(formulaPreview?' sdd-bulk-formula-footer':'')},
+    formulaPreview&&h('p',null,'ราคาจะเปลี่ยนเมื่อยืนยันบันทึก'),
+    (!formulaView||batch.status!=='preview'||needsCheck)&&h('button',{disabled:busy,className:needsCheck||batch.status==='needs_reconciliation'?'sdd-primary':undefined,onClick:check},'ตรวจผลชุดเดิม'),
+    ['preview','running'].includes(batch.status)&&batch.pending>0&&h('button',{className:'sdd-primary',disabled:busy||needsCheck||(zeroRequired&&!zero),onClick:execute},batch.status==='preview'?(temporaryView?'บันทึกโปร ':'บันทึก ')+batch.pending+' รายการ':'บันทึกรายการที่เหลือต่อ'),
+    batch.status==='needs_reconciliation'&&h('button',{disabled:busy,onClick:stop},'หยุดรายการที่เหลือ'),
+    !formulaPreview&&h('button',{disabled:busy||needsCheck||batch.status==='needs_reconciliation',onClick:formulaView?editFormula:()=>{if(temporaryView)setMode('temporary');setBatch(null);}},eventId?'กลับไปตรวจเหตุการณ์':formulaView?'เริ่มตั้งสูตรใหม่':'กลับไปแก้ราคา'))));
 }
 function App(){
  const initial=useRef(readWorkspaceLocation(window.location?.search||'')).current;
  const [viewOptions,setViewOptions]=useState(workspaceOptions(initial));
  const updateOptions=patch=>setViewOptions(v=>({...v,...patch}));
  const [catalogImport,setCatalogImport]=useState(false);
+ const [cacheJob,setCacheJob]=useState(''),[auditOptions,setAuditOptions]=useState(null);
+ const [bulkSelection,setBulkSelection]=useState(new Map()),[bulkAction,setBulkAction]=useState(null);
+ const [bulkOpenError,setBulkOpenError]=useState('');
+ async function openBulk(){
+  setBulkOpenError('');
+  if(!bulkSelection.size){setBulkAction({});return;}
+  setBulkAction({loading:true});
+  try{
+   const selected=[...bulkSelection.values()],update={items:[],unavailable:[]};
+   for(let offset=0;offset<selected.length;offset+=100){
+    const ids=selected.slice(offset,offset+100).map(row=>row.id);
+    const snapshot=await api('workspace-sync',{ids,client_id:clientId.current});
+    if(ids.some(id=>!snapshot.items.some(row=>row.id===id)&&!snapshot.unavailable.includes(id)))throw new Error('โหลดข้อมูลสินค้าที่เลือกไม่ครบ กรุณาลองอีกครั้ง');
+    update.items.push(...snapshot.items);
+    update.unavailable.push(...snapshot.unavailable);
+   }
+   setBulkSelection(new Map(mergeLiveRows(selected,update).map(row=>[row.id,row])));
+   if(update.unavailable.length){
+    setBulkOpenError('นำสินค้า '+update.unavailable.length+' รายการที่เข้าถึงไม่ได้ออกจากรายการที่เลือก กรุณาตรวจรายการที่เหลือ');
+    closeBulk(false);
+   }else setBulkAction({});
+  }catch(e){
+   setBulkOpenError('ตรวจราคาล่าสุดของรายการที่เลือกไม่ได้ · '+e.message);
+   closeBulk(false);
+  }
+ }
+ function closeBulk(chooseProduct){
+  const returningToAudit=!!bulkAction?.eventId;
+  setBulkAction(null);
+  if(returningToAudit)return;
+  requestAnimationFrame(()=>document.getElementById(chooseProduct?'sdd-catalog-search':'sdd-bulk-trigger')?.focus());
+ }
+ function bulkChanged(saved){
+  setBulkSelection(current=>{
+   const next=new Map(current);
+   for(const {product_id,field,after,schedule} of saved){
+    const row=next.get(product_id);
+    if(!row)continue;
+    if(!schedule)next.set(product_id,{...row,[field]:after});
+    else if(row.temporary_sale?.id===schedule.id)next.set(product_id,{...row,
+     ...(schedule.status==='active'?{sale_price:after,current_price:after}:{}),
+     temporary_sale:{...schedule,price:after}});
+   }
+   return next;
+  });
+  setTick(t=>t+1);
+ }
+ function selectBulk(row,selected){setBulkSelection(current=>{
+  const next=new Map(current);if(selected&&next.size<200)next.set(row.id,row);else if(!selected)next.delete(row.id);return next;
+ });}
+ const lastProductOrigin=useRef(null);
  const [focusedProduct,setFocusedProduct]=useState(initial.product?{id:initial.product,field:initial.field}:null),[calendarMonth,setCalendarMonth]=useState(initial.month);
  const [data,setData]=useState({items:[],page:1,pages:0,total:0,catalog_total:0}),[search,setSearch]=useState(initial.search),[query,setQuery]=useState(initial.search),[page,setPage]=useState(initial.page),[size,setSize]=useState(initial.size),[brand,setBrand]=useState(initial.brand),[status,setStatus]=useState(initial.status),[source,setSource]=useState(initial.source),[promotionPost,setPromotionPost]=useState(initial.promotionPost),[articleSearch,setArticleSearch]=useState(''),[articles,setArticles]=useState([]),[articlesError,setArticlesError]=useState(''),[brands,setBrands]=useState([]),[brandSearch,setBrandSearch]=useState(''),[loading,setLoading]=useState(false),[error,setError]=useState(''),[setup,setSetup]=useState(cfg.canSettings&&initial.view==='setup'),[dashboard,setDashboard]=useState(cfg.canSettings&&initial.view==='dashboard'),[calendar,setCalendar]=useState(cfg.canSettings&&initial.view==='calendar'),[alertState,setAlertState]=useState('loading'),[auditProduct,setAuditProduct]=useState(null),[tick,setTick]=useState(0),[session,setSession]=useState(false),[orderby,setOrderby]=useState(initial.orderby),[order,setOrder]=useState(initial.order),[promoId,setPromoId]=useState(null),[filters,setFilters]=useState(false),[confirmation,setConfirmation]=useState(null),[scope,setScope]=useState(initial.scope),[promotion,setPromotion]=useState(initial.promotion);
  const [draftTick,setDraftTick]=useState(0);
  useEffect(()=>{const update=()=>setDraftTick(n=>n+1);window.addEventListener('sdd:draft-update',update);return()=>window.removeEventListener('sdd:draft-update',update);},[]);
  const pendingDrafts=collectPendingDrafts(drafts,promoDrafts);
+ const writeEpoch=useRef(0);
  const generation=useRef(0),clientId=useRef(uuid()),liveState=useRef({}),lastWorkspaceURL=useRef(window.location?.href||'');
  const [syncAt,setSyncAt]=useState(''),[syncMessage,setSyncMessage]=useState('');
  const [brandsStatus,setBrandsStatus]=useState('loading'),[brandsError,setBrandsError]=useState('');
@@ -1307,8 +2051,8 @@ function App(){
   const focused=()=>{const el=document.activeElement;if(!el||!el.matches('input,select,textarea')||el.disabled)return null;const row=el.closest('[data-product-id],[data-promotion-for]'),field=el.dataset.sddField||el.closest('[data-sdd-focus-field]')?.dataset.sddFocusField;return row&&field?{product_id:row.dataset.productId||row.dataset.promotionFor,field}:null;};
   const poll=async(clear=false)=>{
    if(stopped||running||liveState.current.loading||(!clear&&Date.now()<nextAttempt)||(!clear&&document.hidden))return;
-   running=true;const g=generation.current,active=clear?null:focused(),ids=clear?[]:[...new Set([...document.querySelectorAll('tr[data-product-id]')].map(e=>e.dataset.productId))];
-   try{for(let offset=0;offset<Math.max(1,ids.length);offset+=100){const body={ids:ids.slice(offset,offset+100),client_id:clientId.current};if(offset===0)body.active=active;const update=await api('workspace-sync',body);if(stopped||g!==generation.current)break;if(!clear){Object.entries(update.cache_updates||{}).forEach(([id,status])=>cacheUpdates.set(id,status));window.dispatchEvent(new CustomEvent('sdd:cache-update'));window.dispatchEvent(new CustomEvent('sdd:workspace-sync',{detail:update}));}}}
+   running=true;const g=generation.current,epoch=writeEpoch.current,active=clear?null:focused(),ids=clear?[]:[...new Set([...document.querySelectorAll('tr[data-product-id]')].map(e=>e.dataset.productId))];
+   try{for(let offset=0;offset<Math.max(1,ids.length);offset+=100){const body={ids:ids.slice(offset,offset+100),client_id:clientId.current};if(offset===0)body.active=active;const update=await api('workspace-sync',body);if(stopped||g!==generation.current||epoch!==writeEpoch.current)break;if(!clear){Object.entries(update.cache_updates||{}).forEach(([id,status])=>cacheUpdates.set(id,status));window.dispatchEvent(new CustomEvent('sdd:cache-update'));window.dispatchEvent(new CustomEvent('sdd:workspace-sync',{detail:update}));}}}
    catch(e){if(!stopped){nextAttempt=Date.now()+(e.status===429?60000:15000);setSyncMessage('อัปเดตอัตโนมัติขัดข้อง · กดรีเฟรชเพื่อลองใหม่');if(e.status===401||e.code==='rest_cookie_invalid_nonce')setSession(true);}}
    finally{running=false;}
   };
@@ -1322,10 +2066,19 @@ function App(){
  useEffect(()=>{showConfirmation=setConfirmation;return()=>{showConfirmation=null;};},[]);
  useEffect(()=>{if(search===query)return;const t=setTimeout(()=>{setQuery(search);setPage(1);},300);return()=>clearTimeout(t);},[search]);
  useEffect(()=>{let alive=true;setBrandsStatus('loading');api('brands').then(r=>{if(alive){setBrands(r.items);setBrandsStatus('ready');setBrandsError('');}}).catch(e=>{if(alive){setBrandsStatus('error');setBrandsError(e.message);}});api('promotion-articles').then(r=>{setArticles(r.items);setArticlesError('');}).catch(e=>setArticlesError(e.message));return()=>{alive=false;};},[tick]);
- useEffect(()=>{const g=++generation.current;setLoading(true);const q=new URLSearchParams({search:query,page,per_page:size,brand,stock_status:status,source,promotion_post:promotionPost,orderby,order,scope,promotion_status:promotion});api('products?'+q).then(r=>{if(g===generation.current){setData(r);setError('');}}).catch(e=>{if(g===generation.current){setError(e.message);if(e.status===401||e.code==='rest_cookie_invalid_nonce')setSession(true);}}).finally(()=>{if(g===generation.current)setLoading(false);});},[query,page,size,brand,status,source,promotionPost,tick,orderby,order,scope,promotion]);
+ const catalogKey=new URLSearchParams({search:query,page,per_page:size,brand,stock_status:status,source,promotion_post:promotionPost,orderby,order,scope,promotion_status:promotion}).toString();
+ const resultsMatch=search===query&&data.queryKey===catalogKey;
+ const catalogWrite=useRef(null);
+ catalogWrite.current=resultsMatch&&!loading&&!error?catalogKey:null;
+ const canWriteCatalog=()=>catalogWrite.current===catalogKey;
+ useEffect(()=>{const g=++generation.current;setLoading(true);api('products?'+catalogKey).then(r=>{if(g===generation.current){setData({...r,queryKey:catalogKey});setError('');}}).catch(e=>{if(g===generation.current){setError(e.message);if(e.status===401||e.code==='rest_cookie_invalid_nonce')setSession(true);}}).finally(()=>{if(g===generation.current)setLoading(false);});},[catalogKey,tick]);
  useEffect(()=>{const handler=e=>{if([...drafts.values(),...promoDrafts.values()].some(d=>d.state!=='clean')){e.preventDefault();e.returnValue='';}};window.addEventListener('beforeunload',handler);return()=>window.removeEventListener('beforeunload',handler);},[]);
  async function refreshSession(){try{await renewNonce();connectionError=null;setSession(false);setError('');setSyncMessage('');setTick(t=>t+1);}catch(e){setSession(true);setError(e.message);}}
- function saved(id,field,value,revision){generation.current++;setTick(t=>t+1);setData(d=>({...d,items:d.items.map(row=>row.id===id?{...row,[field]:value,revisions:{...row.revisions,[field]:revision}}:row)}));}
+ function saved(id,field,value,revision,result){
+  writeEpoch.current++;
+  if(!result)setTick(t=>t+1);
+  setData(d=>({...d,items:d.items.map(row=>applyPriceRow(row,id,field,value,revision,result))}));
+ }
  const context={search:query,brand,stock_status:status,source,promotion_post:promotionPost,orderby,order,tick,scope,promotion_status:promotion};
  const shownArticles=articles.filter(a=>!articleSearch||(a.title+' '+a.id).toLocaleLowerCase().includes(articleSearch.toLocaleLowerCase())||a.id===promotionPost);
  const sortedBrands=[...brands].sort((a,b)=>a.name.localeCompare(b.name,'th',{sensitivity:'base'}));
@@ -1336,13 +2089,26 @@ function App(){
   source&&{id:'source',label:'แหล่งสินค้า: ในบทความโปรโมชัน',clear:()=>{setSource('');setPromotionPost('');setArticleSearch('');}},
   promotionPost&&{id:'article',label:'บทความ: '+(articles.find(a=>a.id===promotionPost)?.title||promotionPost),clear:()=>{setPromotionPost('');setArticleSearch('');}}
  ].filter(Boolean);
- function openDashboardProduct(id,field='temporary_sale'){return navigateFromImport(()=>{setCatalogImport(false);setAuditProduct(null);setFocusedProduct({id:String(id),field:typeof field==='string'?field:'temporary_sale'});});}
+ function openDashboardProduct(id,field='temporary_sale'){return navigateFromImport(()=>{
+  lastProductOrigin.current={id:String(id),dashboard,calendar,field};
+  setCatalogImport(false);setAuditProduct(null);setFocusedProduct({id:String(id),field:typeof field==='string'?field:'temporary_sale'});
+ });}
+ function returnFromProduct(){
+  const origin=lastProductOrigin.current;
+  setFocusedProduct(null);
+  requestAnimationFrame(()=>{
+   const scope=origin?.dashboard?'[data-task-product]':origin?.calendar?'[data-calendar-product]':'[data-product-id]';
+   const match=origin&&[...document.querySelectorAll(scope)].find(el=>(el.dataset.taskProduct||el.dataset.calendarProduct||el.dataset.productId)===origin.id);
+   const control=match?.matches('button')?match:[...(match?.querySelectorAll('button,input,select')||[])].find(el=>!el.disabled&&el.getClientRects().length);
+   (control||document.getElementById(origin?.dashboard?'sdd-task-board':origin?.calendar?'sdd-calendar-title':'sdd-catalog-search'))?.focus();
+  });
+ }
  function clearFilters(){setBrand('');setStatus('');setPromotion('');setSource('');setPromotionPost('');setBrandSearch('');setArticleSearch('');setPage(1);}
  const filter=(label,value,set,options)=>h('label',{className:'sdd-filter'},h('span',null,label),h('select',{'aria-label':label,value,onChange:e=>{set(e.target.value);setPage(1);}},h('option',{value:''},'ทั้งหมด'),options.map(o=>h('option',{key:o.id,value:o.id},o.name))));
- return h('div',{className:'sdd-app'},h('header',{className:'sdd-topbar'},h('a',{className:'sdd-brand',href:cfg.back,onClick:event=>{if(importLeaveGuard){event.preventDefault();navigateFromImport(()=>{window.location.href=cfg.back;});}},'aria-label':'SoundDD กลับหลังบ้าน WordPress'},h('img',{src:cfg.logo,alt:'SoundDD',width:164,height:48})),h('div',{className:'sdd-app-identity'},h('strong',null,'Stock & Price'),h('span',null,'จัดการสินค้าและโปรโมชัน')),h('nav',{className:'sdd-main-nav','aria-label':'เมนูหลัก'},[['products','สินค้า'],...(cfg.canSettings?[['dashboard','ภาพรวมงาน'],['calendar','ปฏิทินโปร'],['setup','ตั้งค่า']]:[])].map(([id,label])=>h('button',{key:id,'aria-current':(id==='products'&&!dashboard&&!calendar&&!setup&&auditProduct===null||id==='dashboard'&&dashboard||id==='calendar'&&calendar||id==='setup'&&setup)?'page':undefined,onClick:()=>navigateFromImport(()=>{setCatalogImport(false);setFocusedProduct(null);setDashboard(id==='dashboard');setCalendar(id==='calendar');setSetup(id==='setup');setAuditProduct(null);})},label,id==='dashboard'&&alertState==='attention'&&h('span',{className:'sdd-alert-dot','aria-label':'มีโปรที่ต้องตรวจสอบ'}),id==='dashboard'&&alertState==='unknown'&&h('span',null,' · ตรวจแจ้งเตือนไม่ได้')))),h('span',{className:'sdd-spacer'}),h('span',{className:'sdd-header-user'},h('span',{className:'sdd-user-avatar','aria-hidden':true},(cfg.user||'S').slice(0,1)),cfg.user),h('button',{className:'sdd-refresh-button','aria-label':'รีเฟรชข้อมูล',onClick:()=>setTick(t=>t+1),disabled:loading},'↻ รีเฟรช')),
+ return h('div',{className:'sdd-app'},h('header',{className:'sdd-topbar'},h('a',{className:'sdd-brand',href:cfg.back,onClick:event=>{if(importLeaveGuard){event.preventDefault();navigateFromImport(()=>{window.location.href=cfg.back;});}},'aria-label':'SoundDD กลับหลังบ้าน WordPress'},h('img',{src:cfg.logo,alt:'SoundDD',width:164,height:48})),h('div',{className:'sdd-app-identity'},h('strong',null,'Stock & Price'),h('span',null,'จัดการสินค้าและโปรโมชัน')),h('nav',{className:'sdd-main-nav','aria-label':'เมนูหลัก'},[['products','สินค้า'],...(cfg.canSettings?[['dashboard','ภาพรวมงาน'],['calendar','ปฏิทินโปร'],['setup','ตั้งค่า']]:[])].map(([id,label])=>h('button',{key:id,'aria-current':(id==='products'&&!dashboard&&!calendar&&!setup&&auditProduct===null||id==='dashboard'&&dashboard||id==='calendar'&&calendar||id==='setup'&&setup)?'page':undefined,onClick:()=>navigateFromImport(()=>{setBulkAction(null);setCacheJob('');setCatalogImport(false);setFocusedProduct(null);setDashboard(id==='dashboard');setCalendar(id==='calendar');setSetup(id==='setup');setAuditProduct(null);})},label,id==='dashboard'&&alertState==='attention'&&h('span',{className:'sdd-alert-dot','aria-label':'มีโปรที่ต้องตรวจสอบ'}),id==='dashboard'&&alertState==='unknown'&&h('span',null,' · ตรวจแจ้งเตือนไม่ได้')))),h('span',{className:'sdd-spacer'}),h('span',{className:'sdd-header-user'},h('span',{className:'sdd-user-avatar','aria-hidden':true},(cfg.user||'S').slice(0,1)),cfg.user),h('button',{className:'sdd-refresh-button','aria-label':'รีเฟรชข้อมูล',onClick:()=>setTick(t=>t+1),disabled:loading},'↻ รีเฟรช')),
  h('main',{className:'sdd-wrap'},pendingDrafts.length>0&&h('div',{className:'sdd-unsaved-banner',role:'status'},h('strong',null,'มีข้อมูลที่ยังไม่บันทึกหรือรอตรวจผล '+pendingDrafts.length+' ช่อง'),h('div',{className:'sdd-draft-links'},pendingDrafts.map(d=>h('button',{key:d.id+':'+d.field,onClick:()=>openDashboardProduct(d.id,d.field)},'#'+d.id+' · '+(d.field==='temporary_sale'?'แบบร่างโปร':labels[d.field]||d.field)+(d.state==='unknown'?' · ตรวจผล':''))))),h('details',{className:'sdd-note'},h('summary',null,'ข้อมูลการอัปเดตและคีย์ลัด'),h('span',null,'ข้อมูลล่าสุด '+((syncAt||data.server_time)?displayDate(syncAt||data.server_time):'—')+' · '+(syncMessage||'อัปเดตราคาที่แสดงทุก 15 วินาที')+' · รีเฟรชเพื่อปรับผลค้นหาและลำดับ · กด Enter เพื่อยืนยันราคา · Esc เพื่อยกเลิก')),
  session&&h('div',{className:'sdd-session',role:'alert'},h('a',{href:cfg.login,target:'_blank',rel:'noopener noreferrer'},'เข้าสู่ระบบอีกแท็บ'),h('button',{onClick:refreshSession},'เชื่อมต่อใหม่'),session&&h('span',null,'หยุดการเชื่อมต่อชั่วคราว ค่าที่พิมพ์ไว้ยังอยู่ · หากเข้าสู่ระบบหมดอายุ ให้เข้าสู่ระบบอีกแท็บแล้วกดเชื่อมต่อใหม่')),
- error&&!focusedProduct&&h('p',{role:'alert',className:'sdd-error'},error),focusedProduct&&auditProduct===null?h(DirectProduct,{key:focusedProduct.id,id:focusedProduct.id,field:focusedProduct.field,tick,onSaved:saved,onClose:()=>setFocusedProduct(null),onAudit:setAuditProduct}):focusedProduct&&auditProduct!==null?h(AuditPanel,{productId:auditProduct,onClose:()=>setAuditProduct(null)}):catalogImport&&cfg.canImportPromotions?h(PromotionImport,{
+ error&&!focusedProduct&&h('p',{role:'alert',className:'sdd-error'},error),bulkAction?.loading?h('p',{role:'status',className:'sdd-loading-notice'},'กำลังโหลดราคาและโปรล่าสุดของรายการที่เลือก…'):bulkAction?h(BulkPricePanel,{selection:bulkSelection,eventId:bulkAction.eventId,onClose:closeBulk,onChanged:bulkChanged}):focusedProduct&&auditProduct===null?h(DirectProduct,{key:focusedProduct.id,id:focusedProduct.id,field:focusedProduct.field,tick,onSaved:saved,onClose:returnFromProduct,onAudit:id=>{setAuditOptions(null);setAuditProduct(id);},onCacheJob:cfg.canManageCache?job=>{setCacheJob(job);setFocusedProduct(null);setSetup(true);}:undefined}):focusedProduct&&auditProduct!==null?h(AuditPanel,{productId:auditProduct,...auditOptions,onClose:()=>{setAuditProduct(null);if(auditOptions?.fromDashboard)setDashboard(true);setAuditOptions(null);},onRollback:eventId=>setBulkAction({eventId})}):catalogImport&&cfg.canImportPromotions?h(PromotionImport,{
   closeLabel:'กลับไปจัดการสินค้า',onClose:()=>{setCatalogImport(false);requestAnimationFrame(()=>document.getElementById('sdd-import-trigger')?.focus());},onComplete:start=>{
    const day=datePart(String(start));
    setCalendarMonth(day.slice(0,7));
@@ -1350,21 +2116,24 @@ function App(){
    setCatalogImport(false);
    setCalendar(true);
   }
- }):calendar?h(PromotionCalendar,{tick,options:viewOptions,onOptions:updateOptions,month:calendarMonth,onMonthChange:setCalendarMonth,onClose:()=>setCalendar(false),onProduct:openDashboardProduct}):dashboard?h(Dashboard,{tick,options:viewOptions,onOptions:updateOptions,onClose:()=>setDashboard(false),onSettings:()=>{setDashboard(false);setSetup(true);},onProduct:openDashboardProduct}):auditProduct!==null?h(AuditPanel,{productId:auditProduct,onClose:()=>setAuditProduct(null)}):setup?h(Setup,{onClose:()=>setSetup(false),onSaved:()=>setTick(t=>t+1)}):h(wp.element.Fragment,null,
+ }):calendar?h(PromotionCalendar,{tick,options:viewOptions,onOptions:updateOptions,month:calendarMonth,onMonthChange:setCalendarMonth,onClose:()=>setCalendar(false),onProduct:openDashboardProduct}):dashboard?h(Dashboard,{tick,options:viewOptions,onOptions:updateOptions,onClose:()=>setDashboard(false),onAudit:cfg.canAudit?(id,initialField,eventId)=>{setDashboard(false);setAuditOptions({initialField,eventId,fromDashboard:true});setAuditProduct(id);}:undefined,onSettings:()=>{setDashboard(false);setSetup(true);},onProduct:openDashboardProduct}):auditProduct!==null?h(AuditPanel,{productId:auditProduct,...auditOptions,onClose:()=>{setAuditProduct(null);if(auditOptions?.fromDashboard)setDashboard(true);setAuditOptions(null);},onRollback:eventId=>setBulkAction({eventId})}):setup?h(Setup,{jobId:cacheJob,onClose:()=>{setCacheJob('');setSetup(false);},onSaved:()=>setTick(t=>t+1)}):h(wp.element.Fragment,null,
  data.write_access&&!data.write_access.enabled&&h('section',{className:'sdd-warning',role:'status'},h('strong',null,'ขณะนี้เป็นโหมดอ่านอย่างเดียว'),h('p',null,data.write_access.reasons.join(' · ')),data.write_access.can_manage_settings?h('button',{onClick:()=>setSetup(true)},'ตั้งค่าเพื่อเปิดการแก้ไข'):h('p',null,'ติดต่อผู้ดูแลเพื่อเปิดการแก้ไขหรือปรับสิทธิ์บัญชี')),
  h('section',{className:'sdd-workspace-heading','aria-labelledby':'sdd-workspace-title'},
   h('div',{className:'sdd-workspace-heading-copy'},h('span',{className:'sdd-dashboard-eyebrow'},'พื้นที่ทำงานของร้าน'),h('h1',{id:'sdd-workspace-title'},'จัดการสินค้าและราคา'),h('p',null,'ค้นหาสินค้า แก้ราคาและสต็อก หรือตั้งโปรชั่วคราวได้ในที่เดียว')),
   h('div',{className:'sdd-workspace-heading-actions'},h('div',{className:'sdd-workspace-total'},h('span',null,'สินค้าในระบบ'),h('strong',null,loading?'…':data.catalog_total.toLocaleString('th-TH')),h('small',null,'ไม่นับตัวเลือกย่อย')),cfg.canImportPromotions&&h('button',{type:'button',id:'sdd-import-trigger','aria-label':'นำเข้าโปรจาก CSV',className:'sdd-secondary sdd-workspace-import',onClick:()=>setCatalogImport(true)},h('span',{className:'sdd-import-label-desktop'},'นำเข้าโปรจาก CSV'),h('span',{className:'sdd-import-label-mobile','aria-hidden':true},'นำเข้า CSV')))),
+ bulkOpenError&&h('p',{role:'alert',className:'sdd-error'},bulkOpenError),
+ cfg.canBulk&&h('div',{className:'sdd-import-actions sdd-catalog-bulk-actions'},h('button',{id:'sdd-bulk-trigger',type:'button',onClick:openBulk},'แก้ราคาหลายรายการ · '+bulkSelection.size+' ที่เลือก'),bulkSelection.size>0&&h('button',{type:'button',onClick:()=>{setBulkOpenError('');setBulkSelection(new Map());}},'ล้างรายการที่เลือก')),
  h(CatalogTabs,{scope,counts:data.tab_counts,loading,onChange:id=>{setScope(id);setPromotion('');setPage(1);setPromoId(null);}}),
  h('small',{className:'sdd-catalog-tabs-hint'},'เลื่อนแท็บเพื่อดูสถานะโปรเพิ่มเติม →'),
  ({current:'แสดงเฉพาะโปรชั่วคราวที่กำลังใช้อยู่',expiring:'เฉพาะโปรชั่วคราวที่กำลังใช้และจะสิ้นสุดภายใน 24 ชั่วโมง',upcoming:'เฉพาะโปรชั่วคราวที่ยังไม่ถึงเวลาเริ่ม'}[scope])&&h('p',{className:'sdd-recent-note',role:'note'},({current:'แสดงเฉพาะโปรชั่วคราวที่กำลังใช้อยู่',expiring:'เฉพาะโปรชั่วคราวที่กำลังใช้และจะสิ้นสุดภายใน 24 ชั่วโมง',upcoming:'เฉพาะโปรชั่วคราวที่ยังไม่ถึงเวลาเริ่ม'}[scope])),
  scope==='recent'&&h('p',{className:'sdd-recent-note'},'แสดงสินค้าที่เปลี่ยนราคาผ่านปลั๊กอินนี้ล่าสุดก่อน รวมการเริ่มและจบโปรชั่วคราว'),
- h('div',{className:'sdd-toolbar'},h('div',{className:'sdd-toolbar-search'},h('label',{className:'sdd-search'},h('span',null,'ค้นหาสินค้า'),h('input',{value:search,onChange:e=>setSearch(e.target.value),maxLength:200,placeholder:data.brand_configured?'ชื่อสินค้า, SKU, แบรนด์ หรือ ID…':'ชื่อสินค้า, SKU หรือ ID…'})),search&&h('button',{className:'sdd-search-clear','aria-label':'ล้างคำค้นสินค้า',onClick:()=>setSearch('')},'×')),h('div',{className:'sdd-toolbar-actions'},h('button',{className:'sdd-filter-toggle','aria-expanded':filters,'aria-controls':'sdd-filter-options',onClick:()=>setFilters(v=>!v)},h('span',{'aria-hidden':true},filters?'▴ ':'▾ '),'ตัวกรอง'+([brand,status,promotion,source,promotionPost].filter(Boolean).length?' ('+[brand,status,promotion,source,promotionPost].filter(Boolean).length+')':'')),h('button',{className:'sdd-clear-filters',onClick:clearFilters,disabled:!selectedFilters.length&&!brandSearch&&!articleSearch},h('span',{'aria-hidden':true},'× '),'ล้างตัวกรอง')),h('div',{id:'sdd-filter-options',className:'sdd-filter-drawer',hidden:!filters},filter('แหล่งสินค้า',source,v=>{setSource(v);setPromotionPost('');setArticleSearch('');},[{id:'new_promotion',name:'ในบทความโปรโมชัน'}]),source==='new_promotion'&&h('label',{className:'sdd-filter sdd-article-search'},h('span',null,'ค้นหาบทความ'),h('input',{value:articleSearch,onChange:e=>setArticleSearch(e.target.value),placeholder:'ชื่อบทความหรือ ID…','aria-label':'ค้นหาบทความโปรโมชัน'})),source==='new_promotion'&&h('label',{className:'sdd-filter sdd-article-picker'},h('span',null,'บทความโปรโมชัน'),h('select',{'aria-label':'เลือกบทความโปรโมชัน',value:promotionPost,onChange:e=>{setPromotionPost(e.target.value);setPage(1);setPromoId(null);}},h('option',{value:''},'ทุกบทความ'),shownArticles.map(a=>h('option',{key:a.id,value:a.id},a.date+' · '+a.title+' (#'+a.id+')')))),h(CatalogBrandFilter,{configured:data.brand_configured,loading:brandsStatus==='loading'||(!data.server_time&&!error),error:brandsError||(!data.server_time?error:''),brands:sortedBrands,search:brandSearch,value:brand,onSearch:setBrandSearch,onChange:value=>{setBrand(value);setPage(1);},onRetry:()=>setTick(t=>t+1),onSetup:cfg.canManageCache?()=>{setSetup(true);requestAnimationFrame(()=>{const heading=document.getElementById('sdd-brands-heading');heading?.focus();heading?.scrollIntoView({block:'start'});});}:null}),filter('สถานะสต็อก',status,setStatus,Object.entries(stock).map(([id,name])=>({id,name}))),!['current','expiring','upcoming'].includes(scope)&&filter('สถานะโปร',promotion,setPromotion,[['none','ไม่มีโปร'],['current','กำลังใช้'],['expiring','ใกล้หมดภายใน 24 ชั่วโมง'],['future','รอเริ่ม'],['expired','หมดอายุแล้ว'],['review','ต้องตรวจสอบ']].map(([id,name])=>({id,name}))),scope==='recent'?h('div',{className:'sdd-filter sdd-sort-fixed',role:'status'},h('span',null,'เรียงตามเวลาที่แก้ไข'),h('div',null,'ใหม่ → เก่า')):h('label',{className:'sdd-filter'},h('span',null,'เรียงตาม'),h('select',{'aria-label':'เรียงตาม',value:orderby+':'+order,onChange:e=>{const [field,direction]=e.target.value.split(':');setOrderby(field);setOrder(direction);setPage(1);}},[['name:asc','ชื่อสินค้า A–Z'],['name:desc','ชื่อสินค้า Z–A'],['sku:asc','SKU A–Z'],['sku:desc','SKU Z–A'],['regular_price:asc','ราคาต่ำไปสูง'],['regular_price:desc','ราคาสูงไปต่ำ']].map(([v,label])=>h('option',{key:v,value:v},label)))),),h('span',{className:'sdd-count','aria-live':'polite',title:'จำนวนสินค้าแม่ที่ตรงคำค้นและตัวกรอง ไม่นับตัวเลือกย่อย'},loading?'กำลังค้นหา…':h(wp.element.Fragment,null,'พบ ',h('strong',null,data.total.toLocaleString('th-TH')),' รายการ'))),
+ h('div',{className:'sdd-toolbar'},h('div',{className:'sdd-toolbar-search'},h('label',{className:'sdd-search'},h('span',null,'ค้นหาสินค้า'),h('input',{id:'sdd-catalog-search',value:search,onChange:e=>setSearch(e.target.value),maxLength:200,placeholder:data.brand_configured?'ชื่อสินค้า, SKU, แบรนด์ หรือ ID…':'ชื่อสินค้า, SKU หรือ ID…'})),search&&h('button',{className:'sdd-search-clear','aria-label':'ล้างคำค้นสินค้า',onClick:()=>setSearch('')},'×')),h('div',{className:'sdd-toolbar-actions'},h('button',{className:'sdd-filter-toggle','aria-expanded':filters,'aria-controls':'sdd-filter-options',onClick:()=>setFilters(v=>!v)},h('span',{'aria-hidden':true},filters?'▴ ':'▾ '),'ตัวกรอง'+([brand,status,promotion,source,promotionPost].filter(Boolean).length?' ('+[brand,status,promotion,source,promotionPost].filter(Boolean).length+')':'')),h('button',{className:'sdd-clear-filters',onClick:clearFilters,disabled:!selectedFilters.length&&!brandSearch&&!articleSearch},h('span',{'aria-hidden':true},'× '),'ล้างตัวกรอง')),h('div',{id:'sdd-filter-options',className:'sdd-filter-drawer',hidden:!filters},filter('แหล่งสินค้า',source,v=>{setSource(v);setPromotionPost('');setArticleSearch('');},[{id:'new_promotion',name:'ในบทความโปรโมชัน'}]),source==='new_promotion'&&h('label',{className:'sdd-filter sdd-article-search'},h('span',null,'ค้นหาบทความ'),h('input',{value:articleSearch,onChange:e=>setArticleSearch(e.target.value),placeholder:'ชื่อบทความหรือ ID…','aria-label':'ค้นหาบทความโปรโมชัน'})),source==='new_promotion'&&h('label',{className:'sdd-filter sdd-article-picker'},h('span',null,'บทความโปรโมชัน'),h('select',{'aria-label':'เลือกบทความโปรโมชัน',value:promotionPost,onChange:e=>{setPromotionPost(e.target.value);setPage(1);setPromoId(null);}},h('option',{value:''},'ทุกบทความ'),shownArticles.map(a=>h('option',{key:a.id,value:a.id},a.date+' · '+a.title+' (#'+a.id+')')))),h(CatalogBrandFilter,{configured:data.brand_configured,loading:brandsStatus==='loading'||(!data.server_time&&!error),error:brandsError||(!data.server_time?error:''),brands:sortedBrands,search:brandSearch,value:brand,onSearch:setBrandSearch,onChange:value=>{setBrand(value);setPage(1);},onRetry:()=>setTick(t=>t+1),onSetup:cfg.canManageCache?()=>{setSetup(true);requestAnimationFrame(()=>{const heading=document.getElementById('sdd-brands-heading');heading?.focus();heading?.scrollIntoView({block:'start'});});}:null}),filter('สถานะสต็อก',status,setStatus,Object.entries(stock).map(([id,name])=>({id,name}))),!['current','expiring','upcoming'].includes(scope)&&filter('สถานะโปร',promotion,setPromotion,[['none','ไม่มีโปร'],['current','กำลังใช้'],['expiring','ใกล้หมดภายใน 24 ชั่วโมง'],['future','รอเริ่ม'],['expired','หมดอายุแล้ว'],['review','ต้องตรวจสอบ']].map(([id,name])=>({id,name}))),scope==='recent'?h('div',{className:'sdd-filter sdd-sort-fixed',role:'status'},h('span',null,'เรียงตามเวลาที่แก้ไข'),h('div',null,'ใหม่ → เก่า')):h('label',{className:'sdd-filter'},h('span',null,'เรียงตาม'),h('select',{'aria-label':'เรียงตาม',value:orderby+':'+order,onChange:e=>{const [field,direction]=e.target.value.split(':');setOrderby(field);setOrder(direction);setPage(1);}},[['name:asc','ชื่อสินค้า A–Z'],['name:desc','ชื่อสินค้า Z–A'],['sku:asc','SKU A–Z'],['sku:desc','SKU Z–A'],['regular_price:asc','ราคาต่ำไปสูง'],['regular_price:desc','ราคาสูงไปต่ำ']].map(([v,label])=>h('option',{key:v,value:v},label)))),),h('span',{className:'sdd-count','aria-live':'polite',title:'จำนวนสินค้าแม่ที่ตรงคำค้นและตัวกรอง ไม่นับตัวเลือกย่อย'},loading?'กำลังค้นหา…':h(wp.element.Fragment,null,'พบ ',h('strong',null,data.total.toLocaleString('th-TH')),' รายการ'))),
+ resultsMatch&&data.exact_sku?.type==='variation'&&h('div',{className:'sdd-recent-note'},h('strong',null,'ตัวเลือกตรง SKU '+data.exact_sku.sku),' · '+data.exact_sku.name+(data.exact_sku.attributes?' · '+data.exact_sku.attributes:''),' ',h('button',{type:'button',onClick:()=>openDashboardProduct(data.exact_sku.id,'regular_price')},'เปิดตัวเลือกนี้')),
  selectedFilters.length>0&&h('div',{className:'sdd-filter-chips','aria-label':'ตัวกรองที่เลือก'},selectedFilters.map(f=>h('button',{key:f.id,'aria-label':'ล้าง '+f.label,onClick:()=>{f.clear();setPage(1);}},f.label,h('span',{'aria-hidden':true},' ×')))),
  source==='new_promotion'&&h('div',{className:'sdd-recent-note',role:'note'},promotionPost?'แสดงสินค้าในบทความที่เลือก · ':'แสดงสินค้าจากทุกบทความที่เผยแพร่ รวมบทความเก่า · ','นับเฉพาะสินค้าที่ระบุรหัสหรือลิงก์ไว้ในบทความ',promotionPost&&articles.find(a=>a.id===promotionPost)&&h(wp.element.Fragment,null,' · ',h('a',{href:articles.find(a=>a.id===promotionPost).url,target:'_blank',rel:'noopener noreferrer'},'เปิดบทความ ↗')),articlesError&&h('span',{role:'alert'},' · โหลดรายชื่อบทความไม่ได้: '+articlesError)),
  promotion==='expired'&&h('div',{className:'sdd-recent-note',role:'note'},'แสดงโปรที่เลยวันสิ้นสุดตาม WooCommerce รวมวันโปรที่ตั้งไว้ก่อนติดตั้งปลั๊กอิน',scope==='recent'&&h(wp.element.Fragment,null,h('span',null,' · แท็บนี้แสดงเฉพาะรายการที่เคยแก้ราคาผ่านปลั๊กอิน '),h('button',{onClick:()=>{setScope('all');setPage(1);setPromoId(null);}},'ดูในสินค้าทั้งหมด'))),
- loading&&h('p',{className:'sdd-loading-notice',role:'status'},'กำลังค้นหาข้อมูลล่าสุด…'),error&&data.items.length>0&&h('p',{className:'sdd-stale-notice',role:'status'},'แสดงข้อมูลก่อนหน้า การโหลดล่าสุดไม่สำเร็จ · กดรีเฟรชเพื่อลองอีกครั้ง'),
- h('div',{id:'sdd-catalog-results',className:'sdd-tablewrap'+(loading?' is-loading':''),role:'tabpanel','aria-labelledby':'sdd-catalog-tab-'+scope,'aria-description':'ตารางเลื่อนได้แนวนอนเพื่อดูทุกคอลัมน์',tabIndex:0,'aria-busy':loading},h('table',null,h('thead',null,h('tr',null,['รูป','สินค้า / SKU','ราคาปกติ','ราคาโปรที่บันทึก','สต็อก','โปรโมชั่น','จัดการ'].map(label=>h('th',{key:label,scope:'col',className:label==='จัดการ'?'sdd-action-heading':label==='ราคาปกติ'||label==='ราคาโปรที่บันทึก'?'sdd-price-heading':label==='สต็อก'||label==='โปรโมชั่น'?'sdd-status-heading':''},label)))),h('tbody',null,data.items.map(row=>h(ProductGroup,{key:row.id,row,context,onSaved:saved,promoId,onPromo:setPromoId,onAudit:setAuditProduct,onOpen:openDashboardProduct})),!data.items.length&&h('tr',null,h('td',{colSpan:7,className:'sdd-empty sdd-catalog-empty'},h('div',{className:'sdd-catalog-empty-content'},h('span',{className:'sdd-catalog-empty-icon','aria-hidden':true},'⌕'),h('strong',null,loading?'กำลังโหลดรายการ…':error?'ยังโหลดรายการไม่ได้':!query&&!selectedFilters.length&&['current','expiring','upcoming'].includes(scope)?'ยังไม่มีโปรชั่วคราวในสถานะนี้':'ไม่พบสินค้าตามคำค้นหรือตัวกรอง'),h('p',null,loading?'กรุณารอสักครู่':error?'กดรีเฟรชเพื่อลองโหลดข้อมูลอีกครั้ง':query||selectedFilters.length?'ลองเปลี่ยนคำค้นหรือล้างตัวกรองเพื่อดูรายการเพิ่มเติม':'เลือกสถานะอื่น หรือกลับไปดูสินค้าทั้งหมดได้'),!loading&&!error&&h('button',{type:'button',className:'sdd-secondary',onClick:()=>{if(query||selectedFilters.length){clearFilters();setSearch('');}else{setScope('all');setPage(1);setPromoId(null);}}},query||selectedFilters.length?'ล้างคำค้นและตัวกรอง':'ดูสินค้าทั้งหมด'))))))),
+ (loading||(!resultsMatch&&!error))&&h('p',{className:'sdd-loading-notice',role:'status'},'กำลังค้นหาข้อมูลล่าสุด…'),error&&resultsMatch&&data.items.length>0&&h('p',{className:'sdd-stale-notice',role:'status'},'แสดงข้อมูลก่อนหน้า · พักการบันทึกในตารางจนกว่าจะโหลดข้อมูลสำเร็จ'),
+ h('div',{id:'sdd-catalog-results',className:'sdd-tablewrap'+(loading?' is-loading':''),role:'tabpanel','aria-labelledby':'sdd-catalog-tab-'+scope,'aria-description':'ตารางเลื่อนได้แนวนอนเพื่อดูทุกคอลัมน์',tabIndex:0,'aria-busy':loading},h('table',null,h('thead',null,h('tr',null,[cfg.canBulk?'เลือก / รูป':'รูป','สินค้า / SKU','ราคาปกติ','ราคาโปรที่บันทึก','สต็อก','โปรโมชั่น','จัดการ'].map(label=>h('th',{key:label,scope:'col',className:label==='จัดการ'?'sdd-action-heading':label==='ราคาปกติ'||label==='ราคาโปรที่บันทึก'?'sdd-price-heading':label==='สต็อก'||label==='โปรโมชั่น'?'sdd-status-heading':''},label)))),h('tbody',null,resultsMatch&&data.items.map(row=>h(ProductGroup,{key:row.id,row,context,onSaved:saved,promoId,onPromo:setPromoId,onAudit:id=>{setAuditOptions(null);setAuditProduct(id);},onOpen:openDashboardProduct,canWrite:canWriteCatalog,bulkSelection,onSelectBulk:cfg.canBulk?selectBulk:undefined})),(!resultsMatch||!data.items.length)&&h('tr',null,h('td',{colSpan:7,className:'sdd-empty sdd-catalog-empty'},h('div',{className:'sdd-catalog-empty-content'},h('span',{className:'sdd-catalog-empty-icon','aria-hidden':true},'⌕'),h('strong',null,(loading||(!resultsMatch&&!error))?'กำลังโหลดรายการ…':error?'ยังโหลดรายการไม่ได้':!query&&!selectedFilters.length&&['current','expiring','upcoming'].includes(scope)?'ยังไม่มีโปรชั่วคราวในสถานะนี้':'ไม่พบสินค้าตามคำค้นหรือตัวกรอง'),h('p',null,(loading||(!resultsMatch&&!error))?'กรุณารอสักครู่':error?'กดรีเฟรชเพื่อลองโหลดข้อมูลอีกครั้ง':query||selectedFilters.length?'ลองเปลี่ยนคำค้นหรือล้างตัวกรองเพื่อดูรายการเพิ่มเติม':'เลือกสถานะอื่น หรือกลับไปดูสินค้าทั้งหมดได้'),resultsMatch&&!loading&&!error&&h('button',{type:'button',className:'sdd-secondary',onClick:()=>{if(query||selectedFilters.length){clearFilters();setSearch('');}else{setScope('all');setPage(1);setPromoId(null);}}},query||selectedFilters.length?'ล้างคำค้นและตัวกรอง':'ดูสินค้าทั้งหมด'))))))),
  h('nav',{className:'sdd-pagination','aria-label':'แบ่งหน้าสินค้า'},h('button',{disabled:page<=1||loading,onClick:()=>setPage(p=>p-1)},'← ก่อนหน้า'),h('span',null,'หน้า '+page+' / '+Math.max(1,data.pages)),h('button',{disabled:page>=data.pages||loading,onClick:()=>setPage(p=>p+1)},'ถัดไป →'),h('span',{className:'sdd-spacer'}),h('label',null,'รายการต่อหน้า ',h('select',{value:size,onChange:e=>{setSize(Number(e.target.value));setPage(1);}},[20,50,100].map(n=>h('option',{key:n,value:n},n))))))),confirmation&&h(Confirmation,{key:confirmation.text,request:confirmation,onDone:answer=>{const current=confirmation;setConfirmation(null);current.resolve(answer);}}));
 }
 wp.element.createRoot(document.getElementById('sdd-root')).render(h(App));

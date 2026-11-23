@@ -1,7 +1,7 @@
 <?php
 /** WP-CLI on disposable Local only. Cloudflare HTTP is intercepted; fixtures/settings are restored. */
 use SDD\{API,CacheSchema,CachePurge,CacheURLs,CloudflareClient,Policy,Schema,Writer,WorkspaceSync,Bulk,TemporarySales,SystemLogs};
-global $wpdb;
+global $wpdb,$wp_rewrite;
 if (wp_get_environment_type()==='production' && !str_contains(ABSPATH,'Local Sites')) { throw new RuntimeException('Disposable Local site required.'); }
 $admin=get_users(['role'=>'administrator','number'=>1,'fields'=>'ID']);wp_set_current_user((int)$admin[0]);
 if (!defined('SDD_CF_ZONE_ID')) { define('SDD_CF_ZONE_ID',str_repeat('a',32)); }
@@ -9,7 +9,7 @@ if (!defined('SDD_CF_API_TOKEN')) { define('SDD_CF_API_TOKEN','fixture-not-a-rea
 if (!defined('SDD_CF_LIVE_VERIFIED')) { define('SDD_CF_LIVE_VERIFIED',true); }
 $failures=[];$checks=0;
 $check=static function(bool $ok,string $label)use(&$failures,&$checks):void{$checks++;echo ($ok?'PASS ':'FAIL ').$label."\n";if(!$ok)$failures[]=$label;};
-$original=[];foreach(['sdd_settings','sdd_cache_settings','sdd_cf_connection','sdd_cf_verification_failure','sdd_cache_settings_audit','sdd_cache_worker_at','sdd_cache_throttle_until','sdd_cache_pause_reason','woocommerce_shop_page_id','woocommerce_cart_page_id'] as $key){$original[$key]=get_option($key,null);}
+$original=[];foreach(['sdd_settings','sdd_cache_settings','sdd_cf_connection','sdd_cf_verification_failure','sdd_cache_settings_audit','sdd_cache_worker_at','sdd_cache_throttle_until','sdd_cache_pause_reason','woocommerce_shop_page_id','woocommerce_cart_page_id','permalink_structure'] as $key){$original[$key]=get_option($key,null);}
 $products=[];$posts=[];$opids=[];$start=null;
 $home=static fn($url)=>preg_replace('#^https?://[^/]+#','https://sdd-cache.test',$url);add_filter('home_url',$home);
 $httpCalls=[];$httpMode='success';$duringHTTP=null;
@@ -31,11 +31,27 @@ try{
  if(!CacheSchema::ready())throw new RuntimeException('Cache schema unavailable');
  $start=(int)$wpdb->get_var('SELECT COALESCE(MAX(id),0) FROM '.CacheSchema::table('outbox'));
  if((int)$wpdb->get_var("SELECT COUNT(*) FROM ".CacheSchema::table('outbox')." WHERE status NOT IN ('accepted','simulated','closed')"))throw new RuntimeException('Resolve unrelated local cache jobs before running fixtures');
+ update_option('permalink_structure','/%postname%/');
+ $wp_rewrite->init();
  delete_option('sdd_cf_connection');delete_option('sdd_cf_verification_failure');delete_option('sdd_cache_pause_reason');
  update_option('sdd_settings',array_replace(Policy::settings(),['confirmation_mode'=>'always','write_stop'=>false,'local_ack'=>true]),false);
  $shop=wp_insert_post(['post_type'=>'page','post_status'=>'publish','post_title'=>'Cache fixture shop','post_name'=>'cache-fixture-shop']);$posts[]=$shop;update_option('woocommerce_shop_page_id',$shop);
  $cart=wp_insert_post(['post_type'=>'page','post_status'=>'publish','post_title'=>'Cache fixture cart','post_name'=>'cache-fixture-cart']);$posts[]=$cart;update_option('woocommerce_cart_page_id',$cart);
  $p=new WC_Product_Simple();$p->set_name('SDD cache purge fixture');$p->set_status('publish');$p->set_regular_price('10000');$p->set_manage_stock(false);$p->save();$pid=$p->get_id();$products[]=$pid;
+ $httpOrigin=static fn($url)=>str_replace('https://sdd-cache.test','http://sdd-cache.test',$url);
+ add_filter('home_url',$httpOrigin,20);
+ try {
+  $liveSettings=array_replace($settings,['dry_run'=>false]);
+  $live=CachePurge::saveSettings($liveSettings);
+  $check(is_wp_error($live)&&$live->get_error_code()==='cache_https_required','live capture requires HTTPS before saving settings');
+  update_option('sdd_cache_settings',$liveSettings,false); // Simulate the settings from an older installation.
+  [$blocked,$input]=$write($pid,'10100');
+  $intent=$wpdb->get_var($wpdb->prepare('SELECT operation_id FROM '.Schema::table('operations').' WHERE operation_id=%s',$input['operation_id']));
+  $check(is_wp_error($blocked)&&$blocked->get_error_code()==='cache_https_required'&&!$intent&&Writer::fresh($pid)->get_regular_price('edit')==='10000','HTTP live capture blocks a price change before recording intent');
+ } finally {
+  remove_filter('home_url',$httpOrigin,20);
+  update_option('sdd_cache_settings',$settings,false);
+ }
  $check(CacheURLs::allowed(get_permalink($pid))&&!CacheURLs::allowed('https://sdd-cache.test.evil.test/p/')&&!CacheURLs::allowed('https://other.test/p/'),'URL inventory enforces exact canonical host');
  $check(!CacheURLs::allowed(wc_get_cart_url())&&!CacheURLs::allowed('https://sdd-cache.test/wp-json/sdd/v1/products')&&!CacheURLs::allowed('https://sdd-cache.test/?rest_route=/sdd/v1/products'),'private pages and REST routes are excluded');
  $check(!CacheURLs::validPayload(['url'=>get_permalink($pid),'headers'=>['Authorization'=>'secret']],false),'unexpected cache-key headers are rejected');
@@ -162,18 +178,45 @@ try{
  $check(CachePurge::statuses([$parent->get_id()])[(string)$parent->get_id()]['pending']===1,'parent row reflects pending variation jobs');$run($vid);
  $preview=Bulk::preview(['ids'=>[(string)$pid],'action'=>'adjust_price','params'=>['target'=>'regular_price','basis'=>'regular_price','direction'=>'increase','unit'=>'baht','amount'=>'100']]);
  if(is_wp_error($preview))throw new RuntimeException('Bulk fixture preview: '.$preview->get_error_message());
+ $productLock=Writer::productLock($pid);
+ $busyProduct=static fn($sql)=>str_contains($sql,'GET_LOCK(')&&str_contains($sql,$productLock)?'SELECT 0':$sql;
+ add_filter('query',$busyProduct);
+ try { $blockedBulk=Bulk::execute($preview['operation_id'],['confirmation_hash'=>$preview['payload_hash'],'acknowledgements'=>['price_change']]); }
+ finally { remove_filter('query',$busyProduct); }
+ $recoverable=Bulk::status($preview['operation_id']);
+ $check(is_wp_error($blockedBulk)&&$blockedBulk->get_error_code()==='lock_timeout'&&$recoverable['pending']===1&&$recoverable['unknown']===0,'bulk pre-write lock timeout leaves the original item pending');
  $bulk=Bulk::execute($preview['operation_id'],['confirmation_hash'=>$preview['payload_hash'],'acknowledgements'=>['price_change']]);$bulkJob=$latest($pid);
  $check(!is_wp_error($bulk)&&$bulk['status']==='completed'&&$job($bulkJob)['source']==='bulk_action'&&($bulk['cache_updates']['pending']??0)===1,'bulk execution creates outbox through the writer');$run($bulkJob);
  $event=(string)$bulk['items'][0]['result']['event_id'];$rollback=Bulk::rollbackPreview($event,[]);
  if(is_wp_error($rollback))throw new RuntimeException('Rollback fixture preview: '.$rollback->get_error_message());
  $rolled=Bulk::execute($rollback['operation_id'],['confirmation_hash'=>$rollback['payload_hash'],'acknowledgements'=>['price_change']]);$rollbackJob=$latest($pid);
  $check(!is_wp_error($rolled)&&$rolled['status']==='completed'&&$job($rollbackJob)['source']==='rollback','rollback creates a new invalidation without replaying the old price operation');$run($rollbackJob);
+ $pendingProduct=new WC_Product_Simple();$pendingProduct->set_name('SDD unstarted bulk fixture');$pendingProduct->set_status('publish');
+ $pendingProduct->set_regular_price('1000');$pendingProduct->save();$products[]=$pendingProduct->get_id();
+ $uncertain=Bulk::preview(['ids'=>[(string)$pid,(string)$pendingProduct->get_id()],'action'=>'adjust_price','params'=>['target'=>'regular_price','basis'=>'regular_price','direction'=>'increase','unit'=>'baht','amount'=>'100']]);
+ if (is_wp_error($uncertain)) { throw new RuntimeException('Could not create uncertain bulk fixture'); }
+ $uncertainId=$uncertain['operation_id'];
+ $wpdb->update(Schema::table('operation_items'),['status'=>'processing'],['item_id'=>$uncertain['items'][0]['item_id']]);
+ $unresolved=Bulk::status($uncertainId);
+ $beforeStop=Writer::fresh($pid)->get_regular_price('edit');
+ $check($unresolved['status']==='needs_reconciliation'&&!empty($unresolved['items'][0]['child_operation_id'])&&is_wp_error(Bulk::stop($uncertainId,[])),'unresolved bulk exposes the original child operation and requires confirmation');
+ $stopped=Bulk::stop($uncertainId,['confirmed'=>true]);
+ $replay=Bulk::execute($uncertainId,['confirmation_hash'=>$uncertain['payload_hash'],'acknowledgements'=>['price_change']]);
+ $check(!is_wp_error($stopped)&&$stopped['status']==='stopped'&&$replay['status']==='stopped'&&$stopped['unknown']===1&&$stopped['pending']===0
+     &&($stopped['progress']['stopped']??0)===1&&Writer::fresh($pid)->get_regular_price('edit')===$beforeStop
+     && Writer::fresh($pendingProduct->get_id())->get_regular_price('edit')==='1000','stopping a bulk batch closes pending rows and preserves uncertain evidence');
  $beforePlan=$latest($pid);$planId=wp_generate_uuid4();
  $plan=TemporarySales::create($pid,['operation_id'=>$planId,'price'=>'9000','start'=>wp_date('Y-m-d\TH:i',time()+3600),'end'=>wp_date('Y-m-d\TH:i',time()+7200),'baseline'=>TemporarySales::snapshot(Writer::fresh($pid)),'confirmed'=>true]);
  $check(!is_wp_error($plan)&&$plan['promotion']['status']==='pending'&&$latest($pid)===$beforePlan,'future promotion registration alone does not claim a price/cache update');
  $wpdb->update(Schema::table('temporary_sales'),['starts_at'=>time()-60],['id'=>$planId]);TemporarySales::tick($planId);$startJob=$latest($pid);
  $check($startJob>$beforePlan&&$job($startJob)['source']==='temporary_start'&&Writer::fresh($pid)->get_sale_price('edit')==='9000','actual promotion start creates a durable invalidation');$run($startJob);
- $wpdb->update(Schema::table('temporary_sales'),['ends_at'=>time()-1],['id'=>$planId]);TemporarySales::tick($planId);$endJob=$latest($pid);
+ $wpdb->update(Schema::table('temporary_sales'),['ends_at'=>time()-1],['id'=>$planId]);
+ add_filter('query',$busyProduct);
+ try { TemporarySales::tick($planId); }
+ finally { remove_filter('query',$busyProduct); }
+ $retryStatus=$wpdb->get_var($wpdb->prepare("SELECT status FROM ".Schema::table('temporary_sales')." WHERE id=%s",$planId));
+ $check($retryStatus==='active'&&$latest($pid)===$startJob,'transient product lock leaves the expired promotion eligible for automatic restoration');
+ TemporarySales::tick($planId);$endJob=$latest($pid);
  $check($endJob>$startJob&&$job($endJob)['source']==='temporary_restore'&&Writer::fresh($pid)->get_sale_price('edit')==='','actual promotion restoration creates its own invalidation');$run($endJob);
  wp_clear_scheduled_hook('sdd_temporary_sale_tick',[$planId,'starts_at']);wp_clear_scheduled_hook('sdd_temporary_sale_tick',[$planId,'ends_at']);
  $settings['capture_enabled']=false;$settings['dispatch_enabled']=false;update_option('sdd_cache_settings',$settings,false);$old=$latest($pid);[$r]=$write($pid,'10900');
@@ -209,6 +252,7 @@ try{
  }
  foreach($posts as $post){wp_delete_post($post,true);}
  foreach($original as $key=>$value){if($value===null)delete_option($key);else update_option($key,$value,false);}
+ $wp_rewrite->init();
  CachePurge::deactivate();CachePurge::schedule();
  echo "Fixture products, queue rows and settings cleaned up; no Cloudflare request sent\n";
 }

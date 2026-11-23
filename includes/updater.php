@@ -26,9 +26,6 @@ final class Updater {
         add_action('admin_post_sdd_check_updates', [self::class, 'handleCheck']);
         add_action('admin_notices', [self::class, 'checkNotice']);
         add_action('network_admin_notices', [self::class, 'checkNotice']);
-        add_action('load-update-core.php', static function (): void {
-            if (!empty($_GET['force-check']) && current_user_can('update_plugins')) { self::checkForUpdates(); }
-        }, 1);
     }
 
     public static function normalizeTransient(mixed $transient): mixed {

@@ -30,6 +30,9 @@ try{
  $record=array_values(array_filter($current['items'],static fn($r)=>$r['id']===(string)$temporary))[0];$check($record['temporary_sale']['ends_at']===$now+7200,'temporary end time is exposed for catalog display');
  $check($record['temporary_sale']['price']==='80'&&array_key_exists('current_price',$record),'catalog exposes current system and temporary target prices');
  $native=$query('all',['promotion_status'=>'future']);$check($contains($native,$future)&&$contains($native,$pending),'all-products filter still includes native WooCommerce schedules');
+ $zero=$make('zero',0,0,'0');
+ $generalCurrent=$query('all',['promotion_status'=>'current']);
+ $check($contains($generalCurrent,$permanent)&&$contains($generalCurrent,$soon)&&$contains($generalCurrent,$temporary)&&$contains($generalCurrent,$zero)&&!$contains($generalCurrent,$none)&&!$contains($generalCurrent,$expired),'general current filter includes native and zero-price promotions without altering temporary tabs');
  $predicate=new ReflectionMethod(Catalog::class,'promotion');
  $sql=$predicate->invoke(null,'p',['promotion'=>'temporary_expiring','now'=>$now]);
  $wpdb->update(Schema::table('temporary_sales'),['ends_at'=>$now+86400],['product_id'=>$temporary]);

@@ -7,6 +7,12 @@ final class CachePurge {
     public static function settings(): array {
         return array_replace(['capture_enabled'=>false,'dispatch_enabled'=>false,'dry_run'=>true,'inventory_ack'=>false,'per_page'=>12,'devices'=>[],'extra_urls'=>[]], (array)get_option('sdd_cache_settings', []));
     }
+    public static function originError(array $settings): ?\WP_Error {
+        if (!$settings['dry_run'] && wp_parse_url(home_url('/'), PHP_URL_SCHEME) !== 'https') {
+            return API::error('cache_https_required','เว็บไซต์ใช้ HTTP จึงเปิดอัปเดตราคาหน้าร้านโหมดส่งจริงไม่ได้ ให้ใช้โหมดทดลองหรือเปิด HTTPS ก่อน',503,['retryable_before_write'=>true]);
+        }
+        return null;
+    }
     public static function boot(): void {
         add_filter('cron_schedules', static function ($s) { $s['sdd_cache_minute']=['interval'=>60,'display'=>'SoundDD cache recovery']; return $s; });
         add_action('sdd_cache_dispatch',[self::class,'dispatch']);
@@ -236,6 +242,9 @@ final class CachePurge {
         if (($in['capture_enabled']||$in['dispatch_enabled']) && (!CacheSchema::ready()||!$in['inventory_ack'])) { return API::error('cache_not_ready','ตรวจฐานข้อมูลและยืนยันรายการหน้าเว็บก่อนเปิดใช้',503); }
         if ($in['dispatch_enabled'] && !self::schedulerReady()) { return API::error('scheduler_unavailable','Action Scheduler ยังไม่พร้อม งานจะถูกเก็บไว้',503); }
         $previous = self::settings();
+        if ($in['dispatch_enabled'] || ($in['capture_enabled'] && !$previous['capture_enabled']) || ($in['capture_enabled'] && $previous['dry_run'])) {
+            if ($originError=self::originError($in)) { return $originError; }
+        }
         $enteringLive = $in['capture_enabled'] && ($previous['dry_run'] || !$previous['capture_enabled']);
         if (!$in['dry_run'] && ($in['dispatch_enabled'] || $enteringLive) && (!CloudflareClient::configured() || !self::liveVerified())) {
             return API::error('live_not_ready','ตรวจการเชื่อมต่อ Cloudflare ก่อนเริ่มส่งคำขอจริง',503);
@@ -369,14 +378,14 @@ final class CachePurge {
         $r=$wpdb->get_row($wpdb->prepare("SELECT COUNT(*) AS jobs,SUM(status NOT IN ('accepted','simulated','closed')) AS pending FROM ".CacheSchema::table('outbox')." WHERE operation_id IN ($marks)",...$operations),ARRAY_A);
         return $wpdb->last_error||!$r?['state'=>'unavailable','jobs'=>null,'pending'=>null]:['state'=>'available','jobs'=>(int)$r['jobs'],'pending'=>(int)$r['pending']];
     }
-    public static function health(int $page = 1, string $filter = 'all'): array {
+    public static function health(int $page = 1, string $filter = 'all', ?int $jobId = null): array {
         $filters = [
             'all' => '1=1',
             'attention' => "j.status='needs_attention'",
             'pending' => "j.status IN ('pending','enumerating','processing','retry_wait')",
         ];
         $filter = isset($filters[$filter]) ? $filter : 'all';
-        $where = $filters[$filter];
+        $where = $jobId === null ? $filters[$filter] : 'j.id='.$jobId;
         $perPage = 25;
         $response = self::configResponse() + [
             'queue'=>self::summary(), 'jobs'=>[], 'jobs_error'=>false,
