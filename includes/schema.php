@@ -142,7 +142,7 @@ final class Schema {
         }
         $shopManager = get_role('shop_manager');
         if ($shopManager) {
-            foreach (['sdd_view_products', 'sdd_edit_products', 'sdd_manage_settings', 'sdd_view_audit', 'sdd_bulk_edit', 'sdd_rollback'] as $cap) { $shopManager->add_cap($cap); }
+            foreach (['sdd_view_products', 'sdd_edit_products', 'sdd_manage_settings', 'sdd_view_audit', 'sdd_view_system_logs', 'sdd_bulk_edit', 'sdd_rollback'] as $cap) { $shopManager->add_cap($cap); }
         }
     }
     /** One-time upgrade migration for sites where plugin updates did not run the activation hook. */
