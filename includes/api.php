@@ -33,18 +33,22 @@ final class API {
                 $query = $r->get_query_params();
                 $page = $query['page'] ?? '1';
                 $filter = $query['filter'] ?? 'all';
-                if (array_diff(array_keys($query), ['page', 'filter']) || !is_scalar($page) || !preg_match('/^[1-9][0-9]{0,5}$/D', (string)$page) || !is_string($filter) || !in_array($filter, ['all', 'attention', 'pending'], true)) {
+                if (array_diff(array_keys($query), ['page', 'filter','job_id']) || !is_scalar($page) || !preg_match('/^[1-9][0-9]{0,5}$/D', (string)$page) || !is_string($filter) || !in_array($filter, ['all', 'attention', 'pending'], true)) {
                     return self::error('invalid_query', 'ตรวจหน้ารายการและตัวกรองงานอีกครั้ง', 400);
                 }
-                return CachePurge::health((int)$page, $filter);
+                $job = $query['job_id'] ?? null;
+                if ($job !== null && (!is_scalar($job) || !preg_match('/^[1-9][0-9]{0,17}$/D',(string)$job))) {
+                    return self::error('invalid_query','รหัสคิวไม่ถูกต้อง',400);
+                }
+                return $job === null ? CachePurge::health((int)$page, $filter) : CachePurge::health((int)$page, $filter, (int)$job);
             }, 'manage_options'],
-            ['/cache-updates/(?P<id>[1-9][0-9]{0,17})/retry', 'POST', static fn($r) => CachePurge::retry((int)$r['id']), 'manage_options'],
+            ['/cache-updates/(?P<id>[1-9][0-9]{0,17})/retry', 'POST', static fn($r) => CachePurge::retry((int)$r->get_url_params()['id']), 'manage_options'],
             ['/cache-updates/(?P<id>[1-9][0-9]{0,17})/close', 'POST', static function($r) {
                 $input = $r->get_json_params();
                 if (!is_array($input) || array_keys($input) !== ['confirmed'] || $input['confirmed'] !== true) {
                     return self::error('confirmation_required', 'ยืนยันการปิดงานอัปเดตหน้าร้านก่อนดำเนินการ', 400);
                 }
-                return CachePurge::close((int)$r['id']);
+                return CachePurge::close((int)$r->get_url_params()['id']);
             }, 'manage_options'],
             ['/cache-updates', 'GET', static function($r) {
                 $in=$r->get_query_params();
@@ -52,7 +56,10 @@ final class API {
                 $ids=array_values(array_filter(array_map('intval',explode(',',$in['ids'])),static fn($id)=>Policy::accessible($id)));
                 return ['items'=>(object)CachePurge::statuses($ids)];
             }, 'sdd_view_products'],
+            ['/promotion-import', 'GET', static fn() => TemporarySales::importHistory(), 'sdd_bulk_edit'],
+            ['/promotion-import/(?P<id>[a-f0-9-]{36})/stop', 'POST', static fn($r) => TemporarySales::stopPermanentImport($r->get_url_params()['id'], $r->get_json_params()), 'sdd_bulk_edit'],
             ['/promotion-import', 'POST', [TemporarySales::class,'importPreview'], 'sdd_bulk_edit'],
+            ['/promotion-bulk', 'POST', static fn($r) => TemporarySales::bulkCreatePreview($r->get_json_params()), 'sdd_bulk_edit'],
             ['/promotion-import/(?P<id>[a-f0-9-]{36})', 'GET', static fn($r) => TemporarySales::importStatus($r->get_url_params()['id']), 'sdd_bulk_edit'],
             ['/promotion-import/(?P<id>[a-f0-9-]{36})', 'POST', static fn($r) => TemporarySales::importConfirm($r->get_url_params()['id'], $r->get_json_params()['revision'] ?? null), 'sdd_bulk_edit'],
             ['/promotion-import/(?P<id>[a-f0-9-]{36})/search', 'GET', static fn($r) => TemporarySales::importSearch($r->get_url_params()['id'],$r->get_query_params()['q'] ?? null,(int)($r->get_query_params()['row'] ?? 0)), 'sdd_bulk_edit'],
@@ -68,6 +75,7 @@ final class API {
             ['/events', 'GET', static fn($r) => Feed::changes($r->get_query_params()), 'sdd_view_products'],
             ['/bulk/preview', 'POST', static fn($r) => is_wp_error($rate=Bulk::rate())?$rate:Bulk::preview($r->get_json_params()), 'sdd_bulk_edit'],
             ['/operations/(?P<id>[a-f0-9-]{36})/execute', 'POST', static fn($r) => is_wp_error($rate=Bulk::rate())?$rate:Bulk::execute($r->get_url_params()['id'],$r->get_json_params()), 'sdd_edit_products'],
+            ['/operations/(?P<id>[a-f0-9-]{36})/stop', 'POST', static fn($r) => Bulk::stop($r->get_url_params()['id'],$r->get_json_params()), 'sdd_edit_products'],
             ['/events/(?P<id>[1-9][0-9]{0,17})/rollback-preview', 'POST', static fn($r) => is_wp_error($rate=Bulk::rate())?$rate:Bulk::rollbackPreview($r->get_url_params()['id'],$r->get_json_params()), 'sdd_rollback'],
             ['/products/(?P<id>[1-9][0-9]{0,17})', 'GET', static fn($r) => Catalog::product((int)$r->get_url_params()['id']), 'sdd_view_products'],
             ['/products', 'GET', static fn($r) => Catalog::products($r->get_query_params()), 'sdd_view_products'],
@@ -77,6 +85,7 @@ final class API {
             ['/products/(?P<id>[1-9][0-9]{0,17})/sale-plan', 'POST', static fn($r) => Writer::salePlan((int)$r->get_url_params()['id'], $r->get_json_params()), 'sdd_edit_products'],
             ['/products/(?P<id>[1-9][0-9]{0,17})/temporary-sales', 'GET', static fn($r) => TemporarySales::listing((int)$r->get_url_params()['id']), 'sdd_manage_settings'],
             ['/products/(?P<id>[1-9][0-9]{0,17})/temporary-sales', 'POST', static fn($r) => TemporarySales::create((int)$r->get_url_params()['id'], $r->get_json_params()), 'sdd_manage_settings'],
+            ['/products/(?P<id>[1-9][0-9]{0,17})/temporary-sales/(?P<promotion>[a-f0-9-]{36})/review', 'GET', static fn($r) => TemporarySales::reviewOperations((int)$r->get_url_params()['id'], $r->get_url_params()['promotion']), 'sdd_manage_settings'],
             ['/products/(?P<id>[1-9][0-9]{0,17})/temporary-sales/(?P<promotion>[a-f0-9-]{36})/cancel', 'POST', static fn($r) => TemporarySales::cancel((int)$r->get_url_params()['id'], $r->get_url_params()['promotion'], $r->get_json_params()), 'sdd_manage_settings'],
             ['/brands', 'GET', static fn($r) => self::terms('product_tag', 1, true), 'sdd_view_products'],
             ['/categories', 'GET', static fn($r) => self::terms('product_cat', (int) ($r['page'] ?? 1), false), 'sdd_view_products'],
@@ -86,6 +95,7 @@ final class API {
             ['/session', 'GET', static fn() => ['ok' => true, 'nonce' => wp_create_nonce('wp_rest')], 'sdd_view_products'],
             ['/products/(?P<id>[1-9][0-9]{0,17})/field', 'POST', static function ($r) { $input = self::writeInput($r->get_json_params()); return is_wp_error($input) ? $input : Writer::execute((int) $r->get_url_params()['id'], $input); }, 'sdd_edit_products'],
             ['/operations/(?P<id>[a-f0-9-]{36})', 'GET', [self::class, 'operation'], 'sdd_view_products'],
+            ['/products/(?P<id>[1-9][0-9]{0,17})/commands/(?P<operation>[a-f0-9-]{36})/abandon', 'POST', static fn($r) => Writer::abandonInline((int)$r->get_url_params()['id'],$r->get_url_params()['operation'],$r->get_json_params()), 'sdd_edit_products'],
         ];
         foreach ($routes as [$path, $method, $handler, $cap]) {
             register_rest_route('sdd/v1', $path, ['methods' => $method, 'callback' => $handler, 'permission_callback' => static fn($r) => self::permission($r, $cap)]);
@@ -123,18 +133,27 @@ final class API {
     public static function saveSettings(\WP_REST_Request $r): array|\WP_Error {
         if (!current_user_can('manage_options')) { return self::error('forbidden', 'เฉพาะผู้ดูแลเว็บไซต์ที่เปลี่ยนการตั้งค่าร้านได้', 403); }
         $in = $r->get_json_params();
-        if (!is_array($in) || array_diff(array_keys($in), ['brand_ids','write_stop','local_ack']) || !isset($in['brand_ids'],$in['write_stop'],$in['local_ack']) || !is_array($in['brand_ids']) || !array_is_list($in['brand_ids']) || count($in['brand_ids']) > 500 || !is_bool($in['write_stop']) || !is_bool($in['local_ack'])) { return self::error('invalid_settings', 'ข้อมูลตั้งค่าไม่ถูกต้อง', 400); }
-        $ids = [];
-        foreach ($in['brand_ids'] as $id) {
-            if (!is_string($id) || !preg_match('/^[1-9][0-9]{0,17}$/D', $id) || !term_exists((int) $id, 'product_tag')) { return self::error('invalid_brand', 'ไม่พบแท็กแบรนด์ที่เลือก', 400); }
-            $ids[] = (int) $id;
+        if (!is_array($in) || array_diff(array_keys($in), ['brand_ids','write_stop','local_ack']) || (!$in)
+            || (array_key_exists('write_stop',$in) && !is_bool($in['write_stop']))
+            || (array_key_exists('local_ack',$in) && (!is_bool($in['local_ack']) || !isset($in['write_stop'])))) {
+            return self::error('invalid_settings', 'ข้อมูลตั้งค่าไม่ถูกต้อง', 400);
         }
-        $in['brand_ids'] = array_values(array_unique($ids)); $in['confirmation_mode'] = 'always';
-        if (!$in['write_stop']) {
+        if (array_key_exists('brand_ids',$in)) {
+            if (!is_array($in['brand_ids']) || !array_is_list($in['brand_ids']) || count($in['brand_ids']) > 500) { return self::error('invalid_settings', 'ข้อมูลตั้งค่าไม่ถูกต้อง', 400); }
+            $ids = [];
+            foreach ($in['brand_ids'] as $id) {
+                if (!is_string($id) || !preg_match('/^[1-9][0-9]{0,17}$/D', $id) || !term_exists((int) $id, 'product_tag')) { return self::error('invalid_brand', 'ไม่พบแท็กแบรนด์ที่เลือก', 400); }
+                $ids[] = (int) $id;
+            }
+            $in['brand_ids'] = array_values(array_unique($ids));
+        }
+        if (($in['write_stop'] ?? true) === false) {
             $blockers = Policy::enableReasons(true);
-            if (!$in['local_ack'] || $blockers) { return self::error('write_unavailable', 'ยังไม่ผ่านเงื่อนไขเปิดการแก้ไขสินค้า', 503, ['blockers' => $blockers, 'confirmation_required' => !$in['local_ack']]); }
+            $confirmed = $in['local_ack'] ?? false;
+            if (!$confirmed || $blockers) { return self::error('write_unavailable', 'ยังไม่ผ่านเงื่อนไขเปิดการแก้ไขสินค้า', 503, ['blockers' => $blockers, 'confirmation_required' => !$confirmed]); }
         }
-        update_option('sdd_settings', $in, false); return self::settingsResponse();
+        if (!Policy::updateSettings($in + ['confirmation_mode'=>'always'])) { return self::error('settings_unavailable', 'ยังบันทึกการตั้งค่าไม่ได้ กรุณาตรวจอีกครั้ง', 503); }
+        return self::settingsResponse();
     }
     public static function operation(\WP_REST_Request $r): array|\WP_Error {
         global $wpdb;

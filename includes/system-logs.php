@@ -75,14 +75,18 @@ final class SystemLogs {
         $real=realpath($path);$root=realpath($directory);
         if (!$real || !$root || !is_file($real) || !str_starts_with($real,rtrim($root,DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR) || filesize($real)>self::MAX_FILE_BYTES) { return API::error('log_unavailable','ไฟล์ log ใหญ่เกินขอบเขตหรืออ่านไม่ได้',413); }
         $stream=$file->get_stream(); if (!is_resource($stream)) { return API::error('log_unavailable','อ่านไฟล์ log ไม่ได้',503); }
-        $items=[];$scanned=0;
+        $items=[];$matched=0;$bytes=0;$partial=false;
         try {
-            while (!feof($stream) && $scanned<10000 && count($items)<200) {
-                $line=fgets($stream,4096); if ($line===false) { break; } $scanned++;
-                $entry=self::parseLine($line); if ($entry) { $items[]=$entry; }
+            while ($bytes<self::MAX_FILE_BYTES && ($line=fgets($stream,4096))!==false) {
+                $bytes+=strlen($line);
+                $complete=str_ends_with($line,"\n") || feof($stream);
+                if (!$partial && $complete && ($entry=self::parseLine($line))) { $items[$matched++ % 200]=$entry; }
+                $partial=!$complete;
             }
         } finally { if (method_exists($file,'close_stream')) { $file->close_stream(); } }
-        return ['id'=>$id,'created_at'=>gmdate('c',(int)$file->get_created_timestamp()),'items'=>array_reverse($items),'truncated'=>$scanned>=10000 || count($items)>=200];
+        $start=$matched>200?$matched%200:0;
+        $latest=array_merge(array_slice($items,$start),array_slice($items,0,$start));
+        return ['id'=>$id,'created_at'=>gmdate('c',(int)$file->get_created_timestamp()),'items'=>array_reverse($latest),'truncated'=>$bytes>=self::MAX_FILE_BYTES || $matched>200];
     }
 
     /** Return only normalized fields; never echo a raw line or arbitrary WooCommerce context. */

@@ -23,6 +23,14 @@ try{
  $check(isset($r['current_price'])&&$r['current_price']===wc_get_product($pid)->get_price('edit'),'current price comes from the product, not the planned return amount');
  $check(is_bool($r['automation']['blocked'])&&$r['automation']['blocked']===(bool)Policy::globalReasons(),'automation pause is reported from actual write conditions');
  $check(!empty($match[0]['updated_at'])&&str_ends_with($match[0]['updated_at'],'Z'),'completed return has an actual update timestamp');
+ $guardedClose=['confirmed'=>true,'expected_status'=>'needs_review'];
+ $changed=TemporarySales::cancel($pid,$uuid,$guardedClose);
+ $check(is_wp_error($changed)&&$changed->get_error_code()==='review_required','preparing a replacement refuses a plan that already changed status');
+ $wpdb->update(Schema::table('temporary_sales'),['status'=>'needs_review'],['id'=>$uuid]);
+ $before=TemporarySales::snapshot(wc_get_product($pid));
+ $closed=TemporarySales::cancel($pid,$uuid,$guardedClose);
+ $check(!is_wp_error($closed)&&$closed['promotion']['status']==='cancelled'&&TemporarySales::snapshot(wc_get_product($pid))===$before,
+    'closing the reviewed plan for a replacement preserves price and schedule');
  wp_set_current_user(0);$denied=TemporarySales::listing($pid);$check(is_wp_error($denied)&&$denied->get_error_code()==='forbidden','return status requires product management permission');
 }finally{$wpdb->query('ROLLBACK');echo "Fixtures rolled back\n";}
 if($failures)exit(1);

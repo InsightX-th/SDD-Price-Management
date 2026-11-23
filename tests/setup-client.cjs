@@ -3,7 +3,7 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const vm=require('node:vm');
 const path=require('node:path');
-const source=fs.readFileSync(path.join(__dirname,'../assets/app.js'),'utf8').replace("wp.element.createRoot(document.getElementById('sdd-root')).render(h(App));","globalThis.testSetup={Setup,setApi:fn=>api=fn};");
+const source=fs.readFileSync(path.join(__dirname,'../assets/app.js'),'utf8').replace("wp.element.createRoot(document.getElementById('sdd-root')).render(h(App));","globalThis.testSetup={Setup,setApi:fn=>api=fn,confirm:()=>showConfirmation=request=>request.resolve(true)};");
 const walk=tree=>tree&&typeof tree==='object'?[tree,...tree.children.flatMap(walk)]:[];
 const text=tree=>tree&&typeof tree==='object'?tree.children.map(text).join(' '):tree==null?'':String(tree);
 const settings=(stop=false)=>({settings:{write_stop:stop,brand_ids:[]},schema_ready:true,currency:'THB',prices_include_tax:true});
@@ -15,7 +15,7 @@ function mount(handler){
   useRef(value){const i=cursor++;if(!(i in slots))slots[i]={current:value};return slots[i];},
   useEffect(fn,deps){const i=cursor++,previous=effects[i];if(!previous||deps.some((value,index)=>!Object.is(value,previous.deps[index]))){effects[i]={deps,cleanup:previous?.cleanup};pending.push(()=>{effects[i].cleanup?.();effects[i].cleanup=fn();});}}};
  const ctx=vm.createContext({wp:{element},window:{SDD_CONFIG:{canManageCache:true,timezone:'Asia/Bangkok'}},Intl,Date,URLSearchParams,Map,Set,BigInt});
- vm.runInContext(source,ctx);ctx.testSetup.setApi(async route=>{calls.push(route);return handler(route);});
+ vm.runInContext(source,ctx);ctx.testSetup.confirm();ctx.testSetup.setApi(async (route,body)=>{calls.push(route);return handler(route,body);});
  function render(){cursor=0;tree=ctx.testSetup.Setup({onClose:()=>{},onSaved:()=>{}});while(pending.length)pending.shift()();return tree;}
  async function settle(){for(let i=0;i<8;i++){await Promise.resolve();render();}}
  render();return {render,settle,calls,unmount:()=>effects.forEach(e=>e?.cleanup?.()),get text(){return text(tree);},get writes(){return writes;},get pill(){return walk(tree).find(n=>String(n.props.className||'').startsWith('sdd-write-pill'));},button:label=>walk(tree).find(n=>n.type==='button'&&text(n)===label)};
@@ -38,4 +38,20 @@ test('brand loading failure does not discard the saved editing status',async()=>
 test('settings can be retried and late responses after leaving do not change state',async()=>{
  let reads=0;const app=mount(route=>{if(route==='settings'){if(!reads++)throw new Error('Settings unavailable');return settings(false);}return route==='health'?health:{items:[],pages:1};});await app.settle();assert.match(text(app.pill),/ยังอ่านสถานะไม่ได้/);await app.button('ลองอ่านการตั้งค่าอีกครั้ง').props.onClick();await app.settle();assert.equal(text(app.pill),'เปิดให้แก้ไขแล้ว');app.unmount();
  let resolve;const late=mount(route=>route==='settings'?new Promise(done=>resolve=done):route==='health'?health:{items:[],pages:1});await late.settle();late.unmount();const before=late.writes;resolve(settings());for(let i=0;i<5;i++)await Promise.resolve();assert.equal(late.writes,before);
+});
+test('pausing editing sends only the pause setting and keeps the unsaved brand draft',async()=>{
+ let payload;
+ const app=mount((route,body)=>{
+  if(route==='settings'){if(body)payload=body;return settings(!!body);}
+  return route==='health'?health:{items:[{id:'9',name:'Brand fixture'}],pages:1};
+ });
+ await app.settle();
+ app.button('เลือกทั้งหมด').props.onClick();
+ app.render();
+ await app.button('หยุดการแก้ไขชั่วคราว').props.onClick();
+ await app.settle();
+ assert.equal(JSON.stringify(payload),'{"write_stop":true}');
+ assert.match(app.text,/เลือก 1 \/ 1/);
+ assert.equal(text(app.pill),'ปิดการแก้ไข');
+ app.unmount();
 });

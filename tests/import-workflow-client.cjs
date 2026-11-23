@@ -98,7 +98,7 @@ test('an incomplete ready response preserves the remembered batch for another st
 });
 test('expiry checks for a completed operation before treating the draft as lost',async()=>{
  let reads=0;const app=mount(()=>reads++?{status:'completed',count:1,first_start:1800}:ready());await app.settle();await app.advance(900000);
- assert.match(app.text,/ตั้งโปรแล้ว 1 รายการ/);assert.doesNotMatch(app.text,/ชุดตรวจหมดอายุแล้ว/);assert.equal(app.calls.length,2);assert.ok(app.calls.every(call=>call.body===undefined));assert.equal(app.storage.size,0);app.unmount();
+ assert.match(app.text,/บันทึกแผนโปรแล้ว 1 รายการ/);assert.doesNotMatch(app.text,/ชุดตรวจหมดอายุแล้ว/);assert.equal(app.calls.length,2);assert.ok(app.calls.every(call=>call.body===undefined));assert.equal(app.storage.size,0);app.unmount();
 });
 
 
@@ -110,4 +110,45 @@ test('CSV row editing, canceling and successful checking restore the relevant ke
  app.component('PromotionImportReadyRow',2).props.onCancel();app.render();assert.equal(focused.at(-1),'[data-import-edit]');
  app.component('PromotionImportReadyRow',2).props.onEdit();app.render();app.component('PromotionImportReadyRow',2).props.onDraft({price:'75'});app.render();
  await app.component('PromotionImportReadyRow',2).props.onCheck({price:'75'});await app.settle();assert.equal(focused.at(-1),'[data-import-edit]');assert.equal(app.calls.filter(call=>call.body).length,1);app.unmount();
+});
+
+test('a fresh tab opens an existing server batch without committing prices',async()=>{
+ const running={status:'running',mode:'permanent',revision:2,count:5,processed:5,total:8};
+ const app=mount(route=>route==='promotion-import'
+  ?{items:[{operation_id:'batch-a',status:'running',updated_at:'2026-11-19T01:00:00Z'}]}
+  :running,{saved:''});
+ await app.button('ดูชุดนำเข้าเดิม').props.onClick();await app.settle();
+ const historyButton=walk(app.render()).find(node=>node.type==='button'&&text(node).startsWith('เปิดชุดที่ยังไม่จบ'));
+ historyButton.props.onClick();await app.settle();
+ assert.equal(app.storage.get('sdd-promotion-import-7'),'batch-a');
+ assert.match(app.text,/ตรวจผล 5 \/ 8/);
+ assert.equal(app.calls.some(call=>call.body!==undefined),false);
+ app.unmount();
+});
+
+test('an uncertain row is identified and stopping requires explicit confirmation',async()=>{
+ const uncertain={status:'needs_reconciliation',mode:'permanent',revision:1,count:1,processed:1,total:3,blocked:{row:3,operation_id:'child-b'}};
+ const app=mount(route=>route.endsWith('/stop')?{...uncertain,status:'completed',stopped:true}:uncertain);
+ await app.settle();
+ assert.match(app.text,/แถว 3 ยังยืนยันผลไม่ได้/);
+ assert.match(app.text,/child-b/);
+ await app.button('หยุดงานที่เหลือ').props.onClick();
+ assert.equal(app.calls.some(call=>call.body!==undefined),false);
+ app.answers.push(true);
+ await app.button('หยุดงานที่เหลือ').props.onClick();await app.settle();
+ assert.equal(app.calls.at(-1).route,'promotion-import/batch-a/stop');
+ assert.equal(app.calls.at(-1).body.confirmed,true);
+ assert.match(app.text,/หยุดงานที่เหลือแล้ว/);
+ app.unmount();
+});
+
+test('a paused server response stops the client loop and preserves batch progress',async()=>{
+ const running={status:'running',mode:'permanent',revision:2,count:5,processed:5,total:8};
+ const app=mount((route,body)=>body?{...running,status:'paused'}:running);
+ await app.settle();
+ await app.button('ทำรายการที่เหลือต่อ').props.onClick();await app.settle();
+ assert.equal(app.calls.filter(call=>call.body!==undefined).length,1);
+ assert.match(app.text,/ระบบพักการบันทึก/);
+ assert.equal(app.storage.get('sdd-promotion-import-7'),'batch-a');
+ app.unmount();
 });

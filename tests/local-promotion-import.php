@@ -49,6 +49,14 @@ try {
     }
     $first = '"'.get_post_field('post_title',$products[0]->get_id(),'raw').'"'.$suffix;
     $second = get_post_field('post_title',$products[1]->get_id(),'raw').$suffix;
+    $skuPreview = $parse->invoke(null,$header.'"'.$products[0]->get_sku().'"'.$suffix);
+    $batches[] = $skuPreview['batch'];
+    $assert(!$skuPreview['errors'] && $skuPreview['rows'][0]['id']===$products[0]->get_id(),'exact SKU resolves the CSV item without guessing from the product name');
+    $wpdb->update($wpdb->posts,['post_title'=>$products[0]->get_sku()],['ID'=>$parent->get_id()]);
+    $skuCollision = $parse->invoke(null,$header.'"'.$products[0]->get_sku().'"'.$suffix);
+    $batches[] = $skuCollision['batch'];
+    $assert(!$skuCollision['rows'] && $skuCollision['errors'][0]['selectable'],'a title and SKU matching different products require a manual choice');
+    $wpdb->update($wpdb->posts,['post_title'=>$parent->get_name()],['ID'=>$parent->get_id()]);
     $sameName = get_post_field('post_title',$products[0]->get_id(),'raw');
     $wpdb->update($wpdb->posts,['post_title'=>$sameName],['ID'=>$parent->get_id()]);
     $ambiguous = $parse->invoke(null,$header.$first);
@@ -108,6 +116,34 @@ try {
     $cannotStop = TemporarySales::importCancel($runningBatch);
     $assert(is_wp_error($cannotStop) && $cannotStop->get_error_code()==='import_started'
         && TemporarySales::importStatus($runningBatch)['status']==='running','running permanent batch cannot be discarded and remains recoverable');
+    $beforePause = Policy::settings();
+    update_option('sdd_settings', array_replace($beforePause, ['write_stop'=>true]));
+    try { $paused = TemporarySales::importConfirm($runningBatch, 1); }
+    finally { update_option('sdd_settings', $beforePause); }
+    $assert(!is_wp_error($paused) && $paused['status']==='paused' && $paused['processed']===0,
+        'paused permanent import preserves unstarted rows');
+    $assert(in_array($runningBatch,array_column(TemporarySales::importHistory()['items'],'operation_id'),true),
+        'actor can recover a running import from server history');
+    $unknownOp = wp_generate_uuid4();
+    $fixtureRows = [
+        ['row'=>2,'id'=>$products[0]->get_id(),'operation'=>wp_generate_uuid4()],
+        ['row'=>3,'id'=>$products[1]->get_id(),'operation'=>$unknownOp],
+        ['row'=>4,'id'=>$products[1]->get_id(),'operation'=>wp_generate_uuid4()],
+    ];
+    $finished = ['row'=>2,'name'=>'Already saved','ok'=>true,'message'=>''];
+    $wpdb->update($ops,['preview_json'=>wp_json_encode(['revision'=>1,'rows'=>$fixtureRows,'results'=>[$finished],
+        'blocked'=>['row'=>3,'product_id'=>$fixtureRows[1]['id'],'operation_id'=>$unknownOp]])],['operation_id'=>$runningBatch]);
+    $unknown = TemporarySales::importConfirm($runningBatch,1);
+    $assert(!is_wp_error($unknown) && $unknown['status']==='needs_reconciliation' && $unknown['blocked']['operation_id']===$unknownOp,
+        'uncertain import stays blocked without replay when canonical result is missing');
+    $stopped = TemporarySales::stopPermanentImport($runningBatch, ['confirmed'=>true]);
+    $assert(!is_wp_error($stopped) && $stopped['stopped'] && $stopped['processed']===1 && $stopped['count']===1
+        && $stopped['blocked']['operation_id']===$unknownOp && !$stopped['errors']
+        && TemporarySales::importConfirm($runningBatch,1)===$stopped,'stopping an uncertain import preserves evidence and prevents future writes');
+    $closed = json_decode($wpdb->get_var($wpdb->prepare("SELECT preview_json FROM $ops WHERE operation_id=%s",$runningBatch)),true);
+    $assert(count($closed['results']) === 3 && $closed['results'][0] === $finished && $closed['results'][1]['stopped']
+        && $closed['results'][2]['stopped'] && !$closed['results'][1]['ok'] && !$closed['results'][2]['ok'],
+        'stopped CSV persists a terminal result for every row so older versions skip them');
     $products[0]->set_regular_price('105');
     $products[0]->save();
     $conflict = TemporarySales::importConfirm($batch,$preview['revision']);
@@ -138,12 +174,16 @@ try {
     $assert(count($candidates['items'])===2,'search shows eligible matching products');
     $similar = TemporarySales::importSearch($multiple['batch'],substr($short,0,-1).'Z');
     $assert(in_array($products[0]->get_id(),array_column($similar['items'],'id'),true),'nearby names are suggested for manual choice');
-    $selected = TemporarySales::importSelect($multiple['batch'],['row'=>2,'product_id'=>$products[0]->get_id()]);
+    foreach ([[],['revision'=>null],['revision'=>0]] as $revisionInput) {
+        $badRevision = TemporarySales::importSelect($multiple['batch'], ['row'=>2,'product_id'=>$products[0]->get_id()] + $revisionInput);
+        $assert(is_wp_error($badRevision) && $badRevision->get_error_code()==='review_required','selection requires the exact draft revision');
+    }
+    $selected = TemporarySales::importSelect($multiple['batch'],['row'=>2,'product_id'=>$products[0]->get_id(),'revision'=>$multiple['revision']]);
     $assert(!$selected['errors'] && $selected['rows'][0]['method']==='manual' && $selected['rows'][0]['price']==='80'
         && $selected['rows'][0]['from']===$start && $selected['rows'][0]['until']===$end,'manual choice preserves file price and dates');
     $stale = TemporarySales::importConfirm($multiple['batch'],$multiple['revision']);
     $assert(is_wp_error($stale) && $stale->get_error_code()==='review_required','older review revision cannot confirm');
-    $duplicate = TemporarySales::importSelect($invalid['batch'],['row'=>4,'product_id'=>$products[0]->get_id()]);
+    $duplicate = TemporarySales::importSelect($invalid['batch'],['row'=>4,'product_id'=>$products[0]->get_id(),'revision'=>$invalid['revision']]);
     $assert(is_wp_error($duplicate) && $duplicate->get_error_code()==='duplicate_product','duplicate selection is rejected with a clear reason');
     $used = TemporarySales::importSearch($invalid['batch'],$short,4);
     $assert(($used['items'][0]['used_row']??null)===2,'search labels products already used by another row');

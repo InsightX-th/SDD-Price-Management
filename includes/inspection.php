@@ -37,7 +37,7 @@ final class Inspection {
         global $wpdb;
         $ready=Schema::ready();$reasons=Policy::globalReasons();$enableReasons=Policy::enableReasons();$queues=[];
         if ($ready) {
-            $stalled=$wpdb->prepare("(status IN ('running','processing') AND updated_at<%s) OR status='unknown'",gmdate('Y-m-d H:i:s',time()-300));
+            $stalled=$wpdb->prepare("(kind <> 'permanent_csv' AND status IN ('running','processing') AND updated_at<%s) OR status IN ('unknown','needs_reconciliation')",gmdate('Y-m-d H:i:s',time()-300));
             $queues['unresolved_operations']=self::sample('operations',$stalled,'status,updated_at');
             $queues['external_pending']=self::sample('external_observations','event_id IS NULL','event_id,id');
             $queues['promotions_review']=self::sample('temporary_sales',"status='needs_review'",'status,starts_at,ends_at');
@@ -49,7 +49,17 @@ final class Inspection {
             ['key'=>'schema','label'=>'โครงสร้างฐานข้อมูล','state'=>$ready?'ok':'blocked','detail'=>$ready?'พร้อม · ฐานข้อมูลรุ่น '.Schema::VERSION:'ฐานข้อมูลยังไม่พร้อม จึงหยุดการบันทึกไว้'],
             ['key'=>'writer','label'=>'เงื่อนไขการบันทึก','state'=>$ready&&!$reasons?'ok':'blocked','detail'=>$ready&&!$reasons?'พร้อมบันทึก โดยตรวจสิทธิ์และข้อจำกัดของสินค้าแต่ละรายการอีกครั้ง':implode(' · ',$reasons?:['ฐานข้อมูลยังไม่พร้อม'])],
             ['key'=>'cache','label'=>'Object cache','state'=>wp_using_ext_object_cache()?'blocked':'ok','detail'=>wp_using_ext_object_cache()?'พบระบบแคชข้อมูลถาวร (Object cache) ซึ่งปลั๊กอินรุ่นนี้ยังไม่รองรับ':'ใช้ cache ปกติของ WordPress'],
-            ['key'=>'cloudflare','label'=>'อัปเดตราคาหน้าร้าน','state'=>$cache['state']==='disabled'?'idle':($cache['state']==='unavailable'||$cache['attention']||($cache['pending']&&!$cache['dispatch_enabled'])?'warning':'ok'),'detail'=>$cache['state']==='disabled'?'ยังไม่เปิด Auto Purge':('งานค้าง '.$cache['pending'].' · ต้องตรวจสอบ '.$cache['attention'].($cache['dry_run']?' · โหมดทดลอง ไม่ส่ง Cloudflare':' · ส่งคำขอจริง'))],
+            ['key'=>'cloudflare','label'=>'อัปเดตราคาหน้าร้าน',
+                'state'=>$cache['operational_state']==='disabled'?'idle':(in_array($cache['operational_state'],['unavailable','stalled','paused_error'],true)||$cache['attention']||($cache['pending']&&!$cache['dispatch_enabled'])?'warning':'ok'),
+                'detail'=>match($cache['operational_state']){
+                    'disabled'=>'ยังไม่เปิดอัปเดตราคาหน้าร้าน',
+                    'paused_error'=>'ต้องตรวจการเชื่อมต่อ Cloudflare',
+                    'stalled'=>'งานเบื้องหลังล่าช้า',
+                    'unavailable'=>'ระบบคิวไม่พร้อม',
+                    'paused'=>'พักการส่ง',
+                    'dry_run'=>'โหมดทดลอง',
+                    default=>'เปิดส่งคำขอจริง',
+                }.($cache['operational_state']==='disabled'?'':' · งานค้าง '.$cache['pending'].' · ต้องตรวจสอบ '.$cache['attention'])],
             ['key'=>'logger','label'=>'Technical log','state'=>$logger['state'],'detail'=>$logger['detail']],
         ];
         foreach ($queues as $key=>$sample) {

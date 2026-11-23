@@ -3,7 +3,7 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const vm=require('node:vm');
 const path=require('node:path');
-const source=fs.readFileSync(path.join(__dirname,'../assets/app.js'),'utf8').replace("wp.element.createRoot(document.getElementById('sdd-root')).render(h(App));","globalThis.ui={Setup,CatalogBrandFilter,ImportPriceSummary,priceChange,MobileProductPrices,importPriceLimit,displayDate,csvRowValues,csvRowIdentity,csvDraftDirty,mergeCsvDrafts,CatalogTabs,CatalogPromotionTiming,PromotionImportReadyRow,App,calendarWeeks,CalendarMonth,DashboardTasks,Dashboard,PromotionCalendar,PromotionImport,PromotionDuplicateChoice,restorationSummary,RestorationCard,collectPendingDrafts,readWorkspaceLocation,workspaceQuery,Confirmation,DirectProduct,cacheUpdateText,CacheQueueSummary,CacheSettings};");
+const source=fs.readFileSync(path.join(__dirname,'../assets/app.js'),'utf8').replace("wp.element.createRoot(document.getElementById('sdd-root')).render(h(App));","globalThis.ui={Setup,CatalogBrandFilter,ImportPriceSummary,priceChange,MobileProductPrices,importPriceLimit,displayDate,csvRowValues,csvRowIdentity,csvDraftDirty,mergeCsvDrafts,CatalogTabs,CatalogPromotionTiming,PromotionImportReadyRow,App,calendarWeeks,CalendarMonth,DashboardTasks,Dashboard,PromotionCalendar,PromotionImport,PromotionDuplicateChoice,restorationSummary,promotionDraftError,RestorationCard,collectPendingDrafts,readWorkspaceLocation,workspaceQuery,Confirmation,DirectProduct,cacheUpdateText,CacheQueueSummary,CacheSettings};");
 function setup(states=[],config={}){let index=0;const h=(type,props,...children)=>({type,props:props||{},children:children.flat(Infinity)});const ctx=vm.createContext({wp:{element:{createElement:h,useState:v=>[index<states.length?states[index++]:typeof v==='function'?v():v,()=>{}],useEffect:()=>{},useRef:v=>({current:v}),Fragment:'fragment'}},window:{SDD_CONFIG:{timezone:'Asia/Bangkok',...config}},crypto:{randomUUID:()=> 'test-id'},Intl,Date,URLSearchParams,Map,Set,BigInt});vm.runInContext(source,ctx);return ctx.ui;}
 const epoch=date=>Date.parse(date+'T12:00:00+07:00')/1000;
 const item=(id,start,end)=>({promotion_id:id,id,name:'Product '+id,status:'active',price:'8000',starts_at:epoch(start),ends_at:epoch(end)});
@@ -26,6 +26,7 @@ test('confirmation button states the actual consequence',()=>{const tree=setup()
 test('cache status distinguishes provider acceptance from verification and dry run',()=>{const ui=setup();assert.equal(ui.cacheUpdateText({state:'disabled'}),'');assert.equal(ui.cacheUpdateText({state:'idle'}),'');assert.match(ui.cacheUpdateText({state:'accepted'}),/รับคำขอ/);assert.doesNotMatch(ui.cacheUpdateText({state:'accepted'}),/ตรวจพบ|ทุกหน้า|สำเร็จ/);assert.match(ui.cacheUpdateText({state:'simulated'}),/ยังไม่ได้อัปเดตบนเว็บไซต์จริง/);assert.match(ui.cacheUpdateText({state:'retry_wait'}),/ลองใหม่/);assert.match(ui.cacheUpdateText({state:'unavailable'}),/ตรวจสถานะ/);});
 test('paused cache queue reports retained work without implying a price failure',()=>{const tree=setup().CacheQueueSummary({data:{state:'available',pending:3,attention:1,dry_run:true,dispatch_enabled:false}});assert.match(text(tree),/2\s+รายการกำลังรอ/);assert.match(text(tree),/1\s+รายการต้องตรวจสอบ/);assert.match(text(tree),/รายการที่รอยังอยู่/);assert.match(text(tree),/ทดลองอยู่/);assert.doesNotMatch(text(tree),/บันทึกราคาล้มเหลว/);assert.equal(setup().CacheQueueSummary({data:{state:'disabled'}}),null);});
 
+test('cache queue summary distinguishes connection failure from a stalled worker',()=>{const {CacheQueueSummary}=setup();const queue={state:'available',pending:1,attention:0};assert.match(text(CacheQueueSummary({data:{...queue,operational_state:'paused_error'}})),/ตรวจการเชื่อมต่อ Cloudflare/);assert.match(text(CacheQueueSummary({data:{...queue,operational_state:'stalled',dispatch_enabled:true}})),/เบื้องหลังล่าช้า/);});
 test('Cloudflare setup needs only connection credentials and hides page-count/device configuration',()=>{const data={credentials_ready:false,live_verified:false,schema_ready:true,scheduler_ready:true,connection:{zone_id:'',has_token:false},settings:{capture_enabled:false,dispatch_enabled:false,dry_run:true,extra_urls:[]},queue:{state:'disabled'},jobs:[]};const tree=setup([data]).CacheSettings();assert.match(text(tree),/Zone ID/);assert.match(text(tree),/API Token/);assert.match(text(tree),/ตรวจการเชื่อมต่อและบันทึก/);assert.doesNotMatch(text(tree),/จำนวนสินค้าที่แสดงต่อหน้า|เว็บไซต์แยกข้อมูลตามอุปกรณ์|SDD_CF_/);const toggles=nodes(tree).filter(n=>n.type==='input'&&n.props.type==='checkbox');assert.equal(toggles.length,2);const master=nodes(tree).find(n=>n.props.className==='sdd-cache-master-toggle');assert.ok(master);});
 
 test('CSV review puts blocking rows first and prevents partial confirmation',()=>{
@@ -201,4 +202,41 @@ test('brand controls distinguish not configured, loading, failure and no matches
  tree=ui.CatalogBrandFilter({configured:false,loading:true});assert.match(text(tree),/กำลังอ่าน/);assert.doesNotMatch(text(tree),/ยังไม่เปิด/);
  tree=ui.CatalogBrandFilter({configured:true,error:'Network',onRetry:()=>{}});assert.match(text(tree),/ลองโหลดแบรนด์อีกครั้ง/);
  tree=ui.CatalogBrandFilter({configured:true,brands:[{id:'1',name:'Soundvision'}],search:'Missing',value:''});assert.match(text(tree),/ไม่พบแบรนด์ตามคำค้น/);
+});
+test('restoration review shows the next actions and opens audit separately from closing',()=>{
+ const {RestorationCard}=setup();
+ const plan={status:'needs_review',message:'ราคาที่แสดงเปลี่ยน',original:{regular_price:'10000',sale_price:'',sale_dates:'|'},ends_at:200};
+ let audit=0,closed=0;
+ const tree=RestorationCard({plan,currentPrice:'8500',onAudit:()=>audit++,onCloseReview:()=>closed++});
+ assert.match(text(tree),/ราคาในระบบล่าสุด\s+8,500/);
+ assert.match(text(tree),/ราคาหลังจบตามแผนเดิม\s+10,000/);
+ assert.match(text(tree),/ราคาที่แสดงเปลี่ยน/);
+ assert.match(text(tree),/เปิดงานนี้ไว้/);
+ const button=label=>nodes(tree).find(n=>n.type==='button'&&text(n)===label);
+ button('เปิดประวัติราคา').props.onClick();
+ assert.equal(audit,1);
+ assert.equal(closed,0);
+ button('ปิดงานและคงราคาปัจจุบัน').props.onClick();
+ assert.equal(closed,1);
+ const readOnly=RestorationCard({plan});
+ assert.match(text(readOnly),/ให้ผู้ดูแลที่มีสิทธิ์/);
+ assert.equal(nodes(readOnly).filter(n=>n.type==='button').length,0);
+});
+test('matching prices and a committed start are not reported as a successful restoration',()=>{
+ const {RestorationCard}=setup();
+ const plan={status:'needs_review',original:{regular_price:'35900',sale_price:'',sale_dates:'|'},ends_at:200};
+ const tree=RestorationCard({plan,currentPrice:'35900',onCheck:()=>{},check:{result:{start:{status:'succeeded'},end:{status:'unknown'}}}});
+ assert.match(text(tree),/ราคาในระบบตรงกับแผนเดิม แต่ยังต้องตรวจผลคำสั่ง/);
+ assert.match(text(tree),/เริ่มโปร ·\s+พบผลบันทึกว่าสำเร็จ/);
+ assert.match(text(tree),/คืนราคาหลังจบ ·\s+พบคำสั่ง แต่ยังยืนยันผลไม่ได้/);
+ assert.doesNotMatch(text(tree),/พบหลักฐานว่าการคืนราคาบันทึกสำเร็จแล้ว/);
+});
+test('promo draft catches the first invalid field before asking for confirmation',()=>{
+ const {promotionDraftError}=setup();
+ const valid={price:'30000',start:'2026-11-19T10:00',end:'2026-11-19T12:00'};
+ assert.equal(promotionDraftError(valid,'70000','2026-11-19T11:00'),null);
+ assert.equal(promotionDraftError({...valid,price:'70000'},'70000','2026-11-19T11:00')[0],'price');
+ assert.equal(promotionDraftError({...valid,start:''},'70000','2026-11-19T11:00')[0],'start');
+ assert.match(promotionDraftError(valid,'70000','2026-11-19T12:00')[1],/สิ้นสุดแล้ว/);
+ assert.match(promotionDraftError({...valid,end:valid.start},'70000','2026-11-19T10:00')[1],/หลังเวลาเริ่ม/);
 });

@@ -5,6 +5,30 @@ final class Policy {
     public const FIELDS = ['regular_price', 'sale_price', 'stock_status', 'sale_dates'];
     public const STOCK = ['instock', 'outofstock', 'onbackorder'];
     public static function settings(): array { return (array) get_option('sdd_settings', []); }
+    public static function updateSettings(array $changes): bool {
+        global $wpdb;
+        $lock = 'sdd:'.substr(hash('sha256', DB_NAME.':'.$wpdb->prefix.':settings'),0,58);
+        $driver = new \mysqli_driver();
+        $previousMode = $driver->report_mode;
+        $locked = false;
+        try {
+            $driver->report_mode = MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT;
+            $locked = (string)$wpdb->get_var($wpdb->prepare('SELECT GET_LOCK(%s,3)', $lock)) === '1';
+            if (!$locked) { return false; }
+            foreach (['sdd_settings','notoptions','alloptions'] as $key) { wp_cache_delete($key,'options'); }
+            $saved = self::settings();
+            $next = array_replace(['write_stop'=>true], $saved, $changes);
+            return $next === $saved || update_option('sdd_settings', $next, false);
+        } catch (\Throwable) {
+            return false;
+        } finally {
+            $driver->report_mode = $previousMode;
+            if ($locked) {
+                try { $wpdb->get_var($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock)); }
+                catch (\Throwable) { /* The disconnected session has already released the lock. */ }
+            }
+        }
+    }
     public static function integer(mixed $value, bool $empty = false): bool {
         return is_string($value) && (($empty && $value === '') || preg_match('/^(0|[1-9][0-9]{0,14})$/D', $value) === 1);
     }
@@ -66,14 +90,25 @@ final class Policy {
         }
         return true;
     }
-    public static function fieldReasons(\WC_Product $p, string $field): array {
+    public static function stockByQuantity(\WC_Product $p): bool {
+        return $p->get_manage_stock('edit') !== false
+            || ($p->is_type('variation') && wc_get_product($p->get_parent_id())?->get_manage_stock('edit') !== false);
+    }
+    public static function supportsBundlePromotion(\WC_Product $p): bool {
+        return $p->is_type('bundle') && $p instanceof \WC_Product_Bundle;
+    }
+    public static function fieldReasons(\WC_Product $p, string $field, bool $allowBundlePrice = false): array {
         $reasons = self::globalReasons();
-        if (!$p->is_type(['simple','variation'])) {
-            $reasons[] = $p->is_type('variable') ? 'สินค้าแม่ variable: ขยายแถวเพื่อแก้แต่ละตัวเลือก' : 'ชนิด ' . $p->get_type() . ' ยังไม่รองรับใน P1; แก้ใน WooCommerce';
+        if (!$p->is_type(['simple','variation']) && !($allowBundlePrice && in_array($field,['regular_price','sale_price'],true) && self::supportsBundlePromotion($p))) {
+            $reasons[] = match ($p->get_type()) {
+                'variable' => 'สินค้าแม่ variable: ขยายแถวเพื่อแก้แต่ละตัวเลือก',
+                'bundle' => 'จัดการข้อมูลส่วนนี้ใน WooCommerce',
+                default => 'ชนิด ' . $p->get_type() . ' ยังไม่รองรับใน P1; แก้ใน WooCommerce',
+            };
             return $reasons;
         }
         if ($field === 'stock_status') {
-            if ($p->get_manage_stock('edit') !== false || ($p->is_type('variation') && wc_get_product($p->get_parent_id())?->get_manage_stock('edit') !== false)) { $reasons[] = 'สถานะอ้างอิงจำนวนสต็อก; แก้จำนวนใน WooCommerce'; }
+            if (self::stockByQuantity($p)) { $reasons[] = 'สถานะอิงจำนวนคงเหลือ แก้จำนวนใน WooCommerce'; }
             return $reasons;
         }
         if ($field !== 'sale_dates' && self::schedule($p)['state'] === 'invalid') { $reasons[] = 'วันเริ่ม–สิ้นสุดโปรไม่ถูกต้อง ให้แก้วันโปรใน WooCommerce ก่อนแก้ราคา'; }
@@ -88,8 +123,8 @@ final class Policy {
         foreach (self::FIELDS as $field) { $all = array_merge($all, self::fieldReasons($p, $field)); }
         return array_values(array_unique($all));
     }
-    public static function validate(\WC_Product $p, string $field, string $value, array $acks): true|\WP_Error {
-        if ($reasons = self::fieldReasons($p, $field)) { return API::error('write_unavailable', implode('; ', $reasons), 503); }
+    public static function validate(\WC_Product $p, string $field, string $value, array $acks, bool $allowBundlePrice = false): true|\WP_Error {
+        if ($reasons = self::fieldReasons($p, $field, $allowBundlePrice)) { return API::error('write_unavailable', implode('; ', $reasons), 503); }
         $v = self::values($p); $old = $v[$field]; $v[$field] = $value;
         if ($field === 'stock_status' && !in_array($value, self::STOCK, true)) { return API::error('invalid_stock', 'สถานะไม่ถูกต้อง', 400); }
         if ($field === 'stock_status') { return true; } // Price-only restrictions do not block a stock-status change.
